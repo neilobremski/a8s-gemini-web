@@ -241,6 +241,10 @@ def send_script(label, message):
     The box is emptied first, which also focuses it — a leftover draft in the
     prompt box would otherwise be sent along with the message. Sending is Enter
     straight after, which is b3t's proven move.
+
+    One known difference from byte-for-byte: `splitlines` drops a trailing
+    newline, so a message that ends in one arrives without it. Interior blank
+    lines, tabs, quotes and indentation all survive.
     """
     if "<<" in label:
         raise GeminiError(
@@ -559,6 +563,33 @@ def _no_prompt(browser, snapshot):
         f"prompt box never appeared (it is normally named {PROMPT_FALLBACK_LABEL!r}). "
         f"`a8s-browser -s {seat} snap` shows the page now."
     )
+
+
+# How long the page is watched for the turn an uncertain send may have made.
+# It confirms a send; its expiry never disproves one.
+SUBMIT_CONFIRM_SECONDS = 20.0
+
+
+def await_turn_taken(browser, before, now=None, sleep=None):
+    """Whether a turn from this side appears on the page within the window.
+
+    True is proof the message went in. **False is not proof that it did not.**
+    A page renders when it renders, and a snapshot taken a moment too early
+    shows the previous state — which is exactly the reading that, treated as
+    proof, made the driver ask Gemini the same question twice.
+    """
+    now, sleep = now or _now, sleep or _sleep
+    deadline = now() + SUBMIT_CONFIRM_SECONDS
+    while True:
+        try:
+            after = read(browser)
+        except (GeminiError, BrowserError):
+            return False
+        if before and after.counts and after.counts[0] > before[0]:
+            return True
+        if now() >= deadline:
+            return False
+        sleep(POLL_SECONDS)
 
 
 def await_prompt(browser, now=None, sleep=None):

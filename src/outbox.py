@@ -14,8 +14,15 @@ import json
 import os
 import tempfile
 import time
+import uuid
 
 SUFFIX = ".pending"
+CLAIM = ".claim-"
+
+# A claim older than this is assumed to belong to a run that died mid-send and
+# is put back. `tell` takes milliseconds, so nothing healthy is ever reclaimed;
+# without it one crashed flush would strand a reply nobody ever sees again.
+RECLAIM_SECONDS = 300.0
 
 
 class Outbox:
@@ -47,16 +54,43 @@ class Outbox:
         os.replace(handle.name, final)
         return final
 
+    def _reclaim(self, names):
+        """Put back anything a dead run claimed and never finished.
+
+        Returns whether it restored any, because a restored file is not in the
+        listing that was just taken and the caller has to look again.
+        """
+        restored = False
+        for name in names:
+            if CLAIM not in name:
+                continue
+            full = os.path.join(self.path, name)
+            try:
+                if time.time() - os.path.getmtime(full) < RECLAIM_SECONDS:
+                    continue
+                os.rename(full, os.path.join(self.path, name.split(CLAIM, 1)[0]))
+                restored = True
+            except OSError:
+                continue
+        return restored
+
     def waiting(self):
         """Each held reply as (path, recipient, body), oldest first.
 
         A file that is not readable JSON is skipped rather than raised on: it
         is one lost reply, and dying here would lose the turn that is running.
+        A claimed file belongs to a flush in progress and is not listed.
         """
         try:
-            names = sorted(name for name in os.listdir(self.path) if name.endswith(".json"))
+            names = sorted(os.listdir(self.path))
         except OSError:
             return []
+        if self._reclaim(names):
+            try:
+                names = sorted(os.listdir(self.path))
+            except OSError:
+                return []
+        names = [name for name in names if name.endswith(".json")]
         held = []
         for name in names:
             full = os.path.join(self.path, name)
@@ -68,18 +102,55 @@ class Outbox:
                 continue
         return held
 
+    def _claim(self, path):
+        """Take exclusive hold of one held reply, or None if someone else did.
+
+        A rename is the claim. Two flushers can both list a file, but only one
+        of them can move it — the other's rename finds nothing there and it
+        goes on to the next. Reading a file and deleting it after the send is
+        not exclusive consumption, and two runs then deliver the same answer
+        twice.
+        """
+        claimed = f"{path}{CLAIM}{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        try:
+            os.rename(path, claimed)
+        except OSError:
+            return None
+        return claimed
+
+    @staticmethod
+    def _restore(claimed, path):
+        """Put a claim back so the next run finds it, in its original order."""
+        try:
+            os.rename(claimed, path)
+        except OSError:
+            pass
+
     def flush(self, send):
         """Try every held reply. Returns (delivered, still waiting).
 
-        `send` is the same callable the handler uses and answers with a status:
-        0 for delivered. A reply that fails again stays where it is, in order,
-        and the next run tries it.
+        `send` answers with a status, 0 for delivered, and is the network
+        sender rather than whatever the current call does with its own reply.
+        A reply that fails again is put back where it was, in order, and the
+        next run tries it.
         """
         delivered = 0
         for path, recipient, body in self.waiting():
-            if send(recipient, body) != 0:
+            claimed = self._claim(path)
+            if claimed is None:
+                continue
+            try:
+                ok = int(send(recipient, body) or 0) == 0
+            except OSError:
+                self._restore(claimed, path)
                 break
-            self.drop(path)
+            except BaseException:
+                self._restore(claimed, path)
+                raise
+            if not ok:
+                self._restore(claimed, path)
+                break
+            self.drop(claimed)
             delivered += 1
         return delivered, len(self.waiting())
 

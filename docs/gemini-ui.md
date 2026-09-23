@@ -85,7 +85,10 @@ refuses the whole script. Each line of the message therefore travels as a
 `<<MARKER` block, whose content a8s-browser takes verbatim, one block per line
 because a `type` carrying a newline would press Enter and send the message
 half-written. `tests/test_browser_parser.py` checks that rule against
-a8s-browser's own parser when a checkout of it is reachable.
+a8s-browser's own parser when a checkout of it is reachable — point
+`A8S_BROWSER_SRC` at its `src/`. This is not byte-for-byte: a trailing newline
+is dropped by `splitlines`. Indentation, tabs, quotes and interior blank lines
+survive.
 
 **The seat's Chrome window has to be on screen.** a8s-browser restarts a Chrome
 whose `visibilityState` reads `hidden`, which on macOS is what a window behind

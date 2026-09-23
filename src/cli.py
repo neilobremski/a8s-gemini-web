@@ -100,4 +100,6 @@ def main():
         allow=args.allow,
         model=args.model,
         send=None if args.command == "handle" else _print_reply,
+        # `deliver` is deliberately left alone: a hand-run `ask` prints its own
+        # reply, and still hands held replies to their correspondents by `tell`.
     )

@@ -11,8 +11,8 @@ First working driver: Gemini Web answers tells.
 - A structured answer comes back whole. Only `You said` / `Gemini said` end a turn; a section heading inside a reply is part of the reply, not the end of it.
 - A new reply is identified by the page's turn count rather than by its text, so an agent that answers `OK` twice gets two answers instead of one and a timeout.
 - The message reaches Gemini exactly as written — indentation intact, and a message that mentions a shell heredoc is sendable. Each line travels as an a8s-browser block instead of a command argument, because a script line is stripped before it is parsed.
-- A send that fails on the keystroke that submits is reconciled against the page instead of guessed at, so an ambiguous failure never asks Gemini the same question twice.
-- A reply that `tell` will not take is held on disk and delivered by the next run, without spending another turn with Gemini.
+- A send that fails on the keystroke that submits is reconciled against the page instead of guessed at, so an ambiguous failure never asks Gemini the same question twice. Seeing the turn appear proves it was sent; not seeing it proves nothing, and is reported as uncertain rather than retried.
+- A reply that `tell` will not take — including a `tell` that cannot be launched at all — is held on disk and delivered by the next run, without spending another turn with Gemini. Each held reply is claimed before it is sent, so two runs flushing at once cannot deliver one answer twice, and a hand-run `ask` hands held replies to their correspondents rather than printing them to the operator.
 - One turn at a time per seat, and every session-store change is a locked read-modify-write. Two overlapping runs no longer erase each other's conversations or interleave in the same browser window.
 - A store that cannot be written answers the sender with what went wrong, and a stored entry whose URL is not text is ignored rather than carried into the browser.
 - A slow first paint no longer costs a turn: the prompt box is waited for rather than read once, three seconds after a navigation.

@@ -54,8 +54,20 @@ def allowed(sender, spec):
 
 
 def _tell(recipient, body):
-    """Hand one reply to a8s. Returns tell's exit status: 0 is delivered."""
-    return subprocess.run(["tell", recipient, "-"], input=body, text=True, check=False).returncode
+    """Hand one reply to a8s. Returns tell's exit status: 0 is delivered.
+
+    A `tell` that cannot be launched at all — not on the wake's PATH, not
+    executable — is a delivery failure like any other. Letting OSError out
+    would skip the retention below and spend the whole Gemini turn again on
+    the retry.
+    """
+    try:
+        return subprocess.run(
+            ["tell", recipient, "-"], input=body, text=True, check=False
+        ).returncode
+    except OSError as exc:
+        print(f"a8s-gemini-web: `tell` could not be run ({exc})", file=sys.stderr)
+        return 127
 
 
 def _capped(body):
@@ -72,15 +84,27 @@ def _compose(reply, notes):
     return _capped("\n\n".join(parts))
 
 
+def _status(send, recipient, body):
+    """One delivery attempt as a status, however it went wrong.
+
+    A sender that answers with nothing counts as delivered, which is what an
+    in-process caller means. One that cannot start a process at all counts as
+    a failure, not as an exception for somebody else to handle.
+    """
+    try:
+        return int(send(recipient, body) or 0)
+    except OSError as exc:
+        print(f"a8s-gemini-web: delivery to {recipient} could not start ({exc})", file=sys.stderr)
+        return 127
+
+
 def _deliver(send, outbox, recipient, body):
     """Send a reply, and keep it if that fails.
 
-    `send` answers with an exit status; one that answers with nothing counts as
-    delivered, which is what an in-process caller means. A reply that cannot be
-    handed over is held on disk and delivered by the next run of this seat,
-    without asking Gemini anything a second time.
+    A reply that cannot be handed over is held on disk and delivered by the
+    next run of this seat, without asking Gemini anything a second time.
     """
-    if int(send(recipient, body) or 0) == 0:
+    if _status(send, recipient, body) == 0:
         return True
     path = outbox.keep(recipient, body)
     print(
@@ -94,28 +118,24 @@ def _deliver(send, outbox, recipient, body):
 def _reconcile(runner, before, notes, state, exc):
     """Settle whether an uncertain send actually reached the conversation.
 
-    The page is the record. If it grew a turn from this side, the message is in
-    and this turn carries on. If it plainly did not, the message was never sent
-    and the caller keeps it. If the page cannot be read either, nobody knows,
-    and the one thing this must not do is guess "unsent" and ask again.
+    The page is watched for a turn from this side. Seeing one is proof the
+    message went in, and this turn carries on to wait for the answer.
+
+    **Not seeing one proves nothing.** Gemini renders when it renders, and a
+    snapshot taken a moment too early shows the state before the send. Reading
+    that as "never sent" is what asked Gemini the same question twice, so the
+    only thing that is ever treated as a definite non-send is a named failure
+    on a step before the submitting keystroke — which never reaches here.
+    Everything else stays uncertain, and uncertain means the message is kept
+    out of the queue and the sender is told exactly that.
     """
-    try:
-        after = gemini.read(runner)
-    except (gemini.GeminiError, browser.BrowserError):
+    if gemini.await_turn_taken(runner, before):
+        notes.append(
+            "the browser lost its answer while sending, but the message is in the "
+            "conversation, so it was not sent again."
+        )
         state["typed"] = True
-        state["uncertain"] = True
-        raise exc from None
-    if before and after.counts:
-        if after.counts[0] > before[0]:
-            notes.append(
-                "the browser lost its answer while sending, but the message is in the "
-                "conversation, so it was not sent again."
-            )
-            state["typed"] = True
-            return
-        raise gemini.GeminiError(
-            f"{exc} The conversation does not show it, so it was not sent."
-        ) from None
+        return
     state["typed"] = True
     state["uncertain"] = True
     raise exc from None
@@ -178,14 +198,22 @@ def handle(
     model=None,
     runner=None,
     send=None,
+    deliver=None,
 ):
     """`browser_seat`, `browser_cmd`, `allow` and `model` come from the
     definition's argv (a8s vars); unset, they fall back to the environment so a
-    hand-run `handle` behaves the same way."""
+    hand-run `handle` behaves the same way.
+
+    `send` is what this call does with its own reply — `tell` on a wake, and
+    the terminal for a hand-run `ask`. `deliver` is how *held* replies reach
+    their correspondents, and it is `tell` whatever `send` is. They are two
+    arguments because collapsing them means a hand-run `ask` prints somebody
+    else's queued answer to the operator and deletes it unsent.
+    """
     send = send or _tell
+    deliver = deliver or _tell
     store = SessionStore(seat)
     outbox = Outbox(seat, store.root)
-    outbox.flush(lambda to, body: int(send(to, body) or 0))
 
     spec = allow if allow is not None else os.environ.get("A8S_GEMINI_ALLOW", "")
     if not allowed(sender, spec):
@@ -194,6 +222,9 @@ def handle(
             f"{seat}: refusing — {sender} is not on this seat's allowlist.",
         )
         return 0
+
+    # Held replies go out before this turn runs, and never through `send`.
+    outbox.flush(lambda to, body: _status(deliver, to, body))
 
     profile = browser_seat or os.environ.get("A8S_GEMINI_BROWSER_SEAT", "")
     if not profile:

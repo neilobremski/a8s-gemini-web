@@ -14,6 +14,7 @@ from conftest import FakeGeminiSeat
 import browser
 import gemini
 import handler
+import outbox as outbox_module
 import store
 
 
@@ -203,7 +204,8 @@ def test_an_undeliverable_reply_is_held_and_sent_by_the_next_run(
     seat = FakeGeminiSeat(tmp_path)
     code = handler.handle(
         "gemini", "example-sender", "what is the capital of France",
-        browser_seat="profile", allow="example-sender", runner=seat, send=send,
+        browser_seat="profile", allow="example-sender", runner=seat,
+        send=send, deliver=send,
     )
     # The turn was spent, so the message is acked rather than asked again.
     assert code == 0
@@ -214,7 +216,8 @@ def test_an_undeliverable_reply_is_held_and_sent_by_the_next_run(
     # The next run delivers it before it drives the browser for anything else.
     handler.handle(
         "gemini", "example-sender", "and of Spain",
-        browser_seat="profile", allow="example-sender", runner=seat, send=send,
+        browser_seat="profile", allow="example-sender", runner=seat,
+        send=send, deliver=send,
     )
     first = send.sent[0][1]
     assert "capital of France" in first or "ack" in first
@@ -467,3 +470,198 @@ def test_a_page_that_does_not_survive_between_commands_says_so(
     assert code == 1
     assert "not surviving between commands" in outbox.last
     assert "front" in outbox.last
+
+
+# --- second review: four more, all in what happens around a delivery ---------
+
+
+class StaleThenCurrent(FakeGeminiSeat):
+    """A seat that accepts the message, loses its answer, and renders late.
+
+    This is the page nobody can tell apart from one that never got the
+    message — which is the whole point of R2.
+    """
+
+    def __init__(self, *args, stale_snaps=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.swallow_next_send = True
+        self.stale_snaps = stale_snaps
+        self._frozen = None
+
+    def run(self, script):
+        if self.swallow_next_send and "press Enter" in script.splitlines():
+            self.swallow_next_send = False
+            self._frozen = FakeGeminiSeat._snapshot(self)
+            super().run(script)
+            raise browser.BrowserError("the seat stopped answering")
+        return super().run(script)
+
+    def _snapshot(self):
+        if self._frozen is not None and self.stale_snaps > 0:
+            self.stale_snaps -= 1
+            return self._frozen
+        return super()._snapshot()
+
+
+def resumed(seat, sender="example-sender"):
+    """Give a seat a conversation already in progress, and remember it."""
+    seat.history = [("user", "earlier"), ("model", "earlier answer")]
+    seat.url = f"{gemini.APP_URL}/c0001ab"
+    seat.ids.add(gemini.conversation_id(seat.url))
+    store.SessionStore("gemini").remember(sender, seat.url)
+    return seat
+
+
+def test_a_stale_snapshot_never_counts_as_proof_the_message_was_not_sent(
+    tmp_path, outbox, clock, state_home
+):
+    seat = resumed(StaleThenCurrent(tmp_path))
+    code = handler.handle(
+        "gemini", "example-sender", "only once please",
+        browser_seat="profile", allow="example-sender", runner=seat, send=outbox,
+    )
+    # Whatever this turn decides, a8s must not be told to send it again.
+    assert code == 0
+    asked = [prompt for role, prompt in seat.history if role == "user"]
+    assert asked.count("only once please") == 1
+
+
+def test_a_page_that_never_shows_the_turn_is_uncertain_not_unsent(
+    tmp_path, outbox, clock, state_home
+):
+    seat = resumed(StaleThenCurrent(tmp_path, stale_snaps=10_000))
+    code = handler.handle(
+        "gemini", "example-sender", "only once please",
+        browser_seat="profile", allow="example-sender", runner=seat, send=outbox,
+    )
+    assert code == 0
+    assert "NOT sent again" in outbox.last
+    assert "was not sent" not in outbox.last
+
+
+def test_a_confirmed_turn_carries_on_to_the_answer(tmp_path, outbox, clock, state_home):
+    seat = resumed(StaleThenCurrent(tmp_path, stale_snaps=0))
+    code = handler.handle(
+        "gemini", "example-sender", "only once please",
+        browser_seat="profile", allow="example-sender", runner=seat, send=outbox,
+    )
+    assert code == 0
+    assert "is in the conversation" in outbox.last
+
+
+# R3a: a hand-run ask must not eat the network queue
+
+
+def test_a_hand_run_ask_never_delivers_a_held_reply_to_the_terminal(
+    tmp_path, clock, state_home
+):
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    held.keep("someone-else", "an answer that belongs to someone else")
+
+    printed = []
+    network = []
+
+    def display(recipient, body):
+        printed.append((recipient, body))
+
+    def tell(recipient, body):
+        network.append((recipient, body))
+        return 0
+
+    handler.handle(
+        "gemini", "example-sender", "hello",
+        browser_seat="profile", allow="example-sender",
+        runner=FakeGeminiSeat(tmp_path), send=display, deliver=tell,
+    )
+    assert ("someone-else", "an answer that belongs to someone else") in network
+    assert [to for to, _ in printed] == ["example-sender"]
+    assert held.waiting() == []
+
+
+def test_the_cli_leaves_the_network_queue_to_tell():
+    import inspect
+
+    import cli
+
+    source = inspect.getsource(cli)
+    # `ask` overrides `send` only. A `deliver` override would route held
+    # replies to the terminal, which is the defect this guards.
+    assert "send=None if" in source
+    assert "deliver=" not in source.replace("# `deliver`", "")
+
+
+# R3b: two flushers cannot deliver one held reply twice
+
+
+def test_two_flushers_cannot_send_the_same_held_reply_twice(state_home):
+    import threading
+
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    held.keep("someone", "the only copy")
+
+    at_the_gate = threading.Barrier(2)
+    sent = []
+    guard = threading.Lock()
+
+    def send(recipient, body):
+        at_the_gate.wait(timeout=5)
+        with guard:
+            sent.append((recipient, body))
+        return 0
+
+    workers = [threading.Thread(target=held.flush, args=(send,)) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    at_the_gate.wait(timeout=5)
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert len(sent) == 1
+    assert held.waiting() == []
+
+
+def test_a_failed_send_puts_the_held_reply_back(state_home):
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    held.keep("someone", "still waiting")
+    delivered, waiting = held.flush(lambda to, body: 1)
+    assert (delivered, waiting) == (0, 1)
+    assert held.waiting()[0][2] == "still waiting"
+
+
+def test_a_claim_left_by_a_dead_run_comes_back(state_home, monkeypatch):
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    path = held.keep("someone", "abandoned")
+    stranded = held._claim(path)
+    assert held.waiting() == []
+    monkeypatch.setattr(outbox_module, "RECLAIM_SECONDS", -1.0)
+    assert held.waiting()[0][2] == "abandoned"
+    assert not os.path.exists(stranded)
+
+
+# R3c: a tell that cannot even start is a delivery failure
+
+
+def test_a_tell_that_cannot_be_launched_is_a_failed_delivery(monkeypatch, capsys):
+    def missing(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "tell")
+
+    monkeypatch.setattr(handler.subprocess, "run", missing)
+    assert handler._tell("someone", "body") != 0
+
+
+def test_a_sender_that_cannot_start_still_holds_the_reply(tmp_path, clock, state_home):
+    def cannot_start(recipient, body):
+        raise FileNotFoundError(2, "No such file or directory", "tell")
+
+    code = handler.handle(
+        "gemini", "example-sender", "what is the capital of France",
+        browser_seat="profile", allow="example-sender",
+        runner=FakeGeminiSeat(tmp_path), send=cannot_start, deliver=cannot_start,
+    )
+    assert code == 0
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    assert len(outbox_module.Outbox("gemini", root).waiting()) == 1
