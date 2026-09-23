@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Lint in a venv beside the tests one, so ruff never lands in the system or
+# Homebrew python. Arguments pass through: tools/lint --fix
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV="$REPO_ROOT/tests/.venv"
+RUFF_VERSION="0.16.8"
+
+if [ ! -x "$VENV/bin/ruff" ]; then
+  [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
+  "$VENV/bin/pip" install --quiet --upgrade pip
+  "$VENV/bin/pip" install --quiet "ruff==$RUFF_VERSION"
+fi
+
+cd "$REPO_ROOT"
+exec "$VENV/bin/ruff" check . "$@"
