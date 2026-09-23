@@ -36,7 +36,6 @@ below, and put whatever it says now into the constant beside it.
 | `MODEL_BUTTON_SELECTORS` | CSS for that switcher, `button[aria-label^="Open mode picker"]` first | derived from the observed name, **click untested** |
 | `RATE_LIMIT_PHRASES` | Gemini's own quota refusal, matched near the front of a short reply | reading, **untested** |
 | `TROUBLE_PHRASES` | `couldn't generate`, `something went wrong` | b3t |
-| `CONVERSATION_MENU_SELECTORS`, `RENAME_ITEM`, `RENAME_INPUT_SELECTORS` | naming a conversation after its correspondent | **unverified guess** |
 
 The date is when someone looked. The interface changes without notice, so
 treat every row as a reading rather than a constant.
@@ -61,12 +60,21 @@ turn and runs on Gemini's default, and the reply carries a note saying so. The
 text round trip needs no `eval` and no `run-code`, so **a seat that never
 configures a model needs no extra permission at all**.
 
-**Naming the conversation.** The rename control was not in the snapshots that
-were taken; it is probably behind the per-conversation `Show more options` menu
-in the sidebar. The attempt here is a guess, it is non-fatal, and it costs
-nothing when it fails: the stored URL is what identifies a conversation, and
+**Naming the conversation — removed, and do not put it back.** The driver used
+to try a rename through `button[aria-label^="Show more options"]`. That button
+is not a conversation menu: it opens the *response actions* menu for the newest
+reply — `Branch in new chat`, `Listen`, `Export to Docs`, `Draft in Gmail`,
+`Report legal issue`, `See response details` — and `Branch in new chat` is
+preselected. An open menu swallows the keystrokes that follow, so the next
+message went into the menu instead of the prompt box and the turn timed out
+with nothing sent (observed 2026-09-23). A cosmetic feature that can eat a
+whole turn is not worth having: the stored URL identifies a conversation, and
 Gemini titles a chat from its first message anyway — which here is the identity
 preamble, so the title is already about the correspondent.
+
+Note the same name appears twice on the page. `Show more options` in
+`COMPLETION_BUTTONS` is read from a snapshot as evidence a turn finished; it is
+never clicked.
 
 **Rate-limit wording.** Gemini's quota refusal has not been captured, so the
 phrases are a reading. They match only near the front of a short reply, because

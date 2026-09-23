@@ -109,19 +109,14 @@ MODEL_BUTTON_SELECTORS = (
     ".gds-mode-switch-button",
 )
 
-# Naming a conversation is cosmetic — the stored URL identifies it, and Gemini
-# titles a chat from its first message anyway, which here is the preamble. None
-# of this was seen in a snapshot; it is a best attempt.
-CONVERSATION_MENU_SELECTORS = (
-    'button[aria-label^="Show more options"]',
-    'button[data-test-id="actions-menu-button"]',
-)
-RENAME_ITEM = "Rename"
-RENAME_INPUT_SELECTORS = (
-    '[role="dialog"] input',
-    "mat-dialog-container input",
-    'input[data-test-id="conversation-title-input"]',
-)
+# Gemini has no rename control this driver can reach safely. The obvious
+# candidate, `button[aria-label^="Show more options"]`, opens the *response
+# actions* menu - "Branch in new chat", "Listen", "Export to Docs" - whose first
+# item is preselected, so an open menu swallows the next keystrokes and can
+# branch the conversation instead of typing into it. Naming is cosmetic anyway:
+# the stored URL identifies a conversation, and Gemini titles a chat from its
+# first message, which here is the preamble.
+
 
 # `- role "name" [ref=e1] [level=6]: value` — one node of a snapshot.
 NODE = re.compile(
@@ -563,28 +558,3 @@ def choose_model(browser, model, snapshot=""):
             f"Gemini's default{f' ({on})' if on else ''} is in use."
         )
     return ""
-
-
-def name_conversation(browser, title):
-    """Rename the conversation after its correspondent. Best effort.
-
-    The stored URL is what identifies a conversation and Gemini titles a chat
-    from its first message on its own, so a failure here costs a tidy sidebar
-    and nothing else.
-    """
-    failure = _click_first(browser, CONVERSATION_MENU_SELECTORS, "the conversation's menu")
-    if not failure:
-        failure = _click_first(browser, (RENAME_ITEM,), f"the {RENAME_ITEM!r} menu item")
-    if not failure:
-        for selector in RENAME_INPUT_SELECTORS:
-            script = f"fill {shlex.quote(selector)} {shlex.quote(title)}\npress Enter"
-            try:
-                transcript = browser.run(script)
-            except BrowserError as exc:
-                failure = f"the rename box ({selector}): {exc}"
-                continue
-            if transcript.ok:
-                return ""
-            failure = f"the rename box ({selector}): {transcript.error}"
-    _dismiss_menu(browser)
-    return f"the conversation could not be named {title!r} — {failure}"

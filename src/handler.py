@@ -75,7 +75,6 @@ def _round_trip(seat, sender, message, runner, store, model, notes, typed):
         notes.append(gemini.choose_model(runner, model, snapshot))
         opening = gemini.send_turn(runner, label, identity.preamble(seat, sender))
         store.remember(sender, gemini.conversation_url(runner))
-        notes.append(gemini.name_conversation(runner, sender))
         if gemini.rate_limited(opening.reply):
             return opening
         baseline = opening.reply

@@ -89,17 +89,13 @@ class FakeGeminiSeat:
         self.model = "Flash"
         self.url = gemini.APP_URL
         self.history = []
-        self.title = ""
         self.scripts = []
         self.draft = ""
-        self.pending_title = None
         self.signed_in = True
         self.conversations = 0
         self.ids = set()
         self.clickable = {
             gemini.MODEL_BUTTON_SELECTORS[0],
-            gemini.CONVERSATION_MENU_SELECTORS[0],
-            gemini.RENAME_ITEM,
         }
 
     def run(self, script):
@@ -168,8 +164,7 @@ class FakeGeminiSeat:
         self.url = args[0] if (not wanted or wanted in self.ids) else gemini.APP_URL
         if not gemini.conversation_id(self.url):
             self.history = []
-            self.title = ""
-        return self.url
+            return self.url
 
     def _do_url(self, args):
         return self.url
@@ -188,9 +183,6 @@ class FakeGeminiSeat:
         if target == self.label:
             self.draft = text
             return target
-        if target in gemini.RENAME_INPUT_SELECTORS:
-            self.pending_title = text
-            return target
         raise StepFailed(f"fill: nothing visible matching {target!r}")
 
     def _do_type(self, args):
@@ -203,12 +195,8 @@ class FakeGeminiSeat:
             self.draft += "\n"
             return key
         if key == "Escape":
-            self.pending_title = None
-            return key
+                return key
         if key != "Enter":
-            return key
-        if self.pending_title is not None:
-            self.title, self.pending_title = self.pending_title, None
             return key
         prompt, self.draft = self.draft, ""
         self.history.append(("user", prompt))

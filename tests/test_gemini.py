@@ -288,16 +288,6 @@ def test_a_model_that_cannot_be_chosen_costs_a_note_and_not_the_turn(seat):
     assert "press Escape" in seat.scripts[-1]
 
 
-def test_naming_a_conversation_is_best_effort(seat):
-    assert gemini.name_conversation(seat, "example-sender") == ""
-    assert seat.title == "example-sender"
-
-    seat.clickable.discard(gemini.CONVERSATION_MENU_SELECTORS[0])
-    note = gemini.name_conversation(seat, "example-sender")
-    assert "could not be named" in note
-    assert gemini.CONVERSATION_MENU_SELECTORS[0] in note
-
-
 def test_a_seat_that_cannot_be_driven_is_reported_as_a_gemini_error(tmp_path):
     seat = ScriptedSeat([browser.BrowserError("Chrome would not start")])
     with pytest.raises(gemini.GeminiError) as exc:
