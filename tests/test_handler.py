@@ -1,0 +1,218 @@
+import os
+
+import pytest
+
+import browser
+import gemini
+import handler
+from store import SessionStore
+
+
+class Outbox:
+    """Every tell this seat sends, instead of the `tell` CLI."""
+
+    def __init__(self):
+        self.sent = []
+
+    def __call__(self, recipient, body):
+        self.sent.append((recipient, body))
+
+    @property
+    def last(self):
+        return self.sent[-1][1]
+
+
+class RefusedSeat:
+    """A seat that fails the test if the browser is touched at all."""
+
+    seat = "profile"
+
+    def run(self, script):
+        raise AssertionError(f"the browser was driven for a refused sender:\n{script}")
+
+
+@pytest.fixture
+def outbox():
+    return Outbox()
+
+
+def answer(node, sender, message, outbox, runner, **kwargs):
+    kwargs.setdefault("browser_seat", "profile")
+    kwargs.setdefault("allow", "example-sender")
+    return handler.handle(node, sender, message, runner=runner, send=outbox, **kwargs)
+
+
+def test_an_empty_allowlist_accepts_nobody(monkeypatch):
+    monkeypatch.delenv("A8S_GEMINI_ALLOW", raising=False)
+    assert not handler.allowed("example-sender", "")
+
+
+def test_the_allowlist_is_case_insensitive():
+    assert handler.allowed("example-sender", "Example-Sender, other")
+    assert handler.allowed("OTHER", "Example-Sender, other")
+    assert not handler.allowed("stranger", "Example-Sender, other")
+
+
+def test_the_argv_allowlist_overrides_the_environment(
+    monkeypatch, seat, outbox, clock, state_home
+):
+    monkeypatch.setenv("A8S_GEMINI_ALLOW", "other")
+    code = answer("gemini", "example-sender", "hi", outbox, seat, allow="example-sender")
+    assert code == 0
+    assert seat.history
+
+
+def test_a_stranger_is_told_no_and_the_browser_is_never_opened(outbox, state_home):
+    code = handler.handle(
+        "gemini",
+        "stranger",
+        "hello",
+        browser_seat="profile",
+        allow="example-sender",
+        runner=RefusedSeat(),
+        send=outbox,
+    )
+    assert code == 0  # a refusal is final; a requeue would repeat it
+    assert outbox.sent[0][0] == "stranger"
+    assert "allowlist" in outbox.last
+
+
+def test_a_node_with_no_browser_seat_says_which_var_is_missing(monkeypatch, outbox, state_home):
+    monkeypatch.delenv("A8S_GEMINI_BROWSER_SEAT", raising=False)
+    code = handler.handle(
+        "gemini", "example-sender", "hello", allow="example-sender",
+        runner=RefusedSeat(), send=outbox,
+    )
+    assert code == 1  # operator-fixable, so the message is kept
+    assert "A8S_GEMINI_BROWSER_SEAT" in outbox.last
+
+
+def test_a_new_correspondent_gets_the_preamble_first_and_a_conversation_of_their_own(
+    seat, outbox, clock, state_home
+):
+    assert answer("gemini", "example-sender", "what is the status", outbox, seat) == 0
+
+    prompts = [text for role, text in seat.history if role == "user"]
+    assert "example-sender" in prompts[0]
+    assert "relay" in prompts[0]
+    assert prompts[1] == "what is the status"
+    assert outbox.sent[0][0] == "example-sender"
+    assert "ack: what is the status" in outbox.last
+
+    stored = SessionStore("gemini").get("example-sender")
+    assert gemini.conversation_id(stored["url"])
+
+
+def test_the_second_message_goes_into_the_same_conversation(seat, outbox, clock, state_home):
+    answer("gemini", "example-sender", "first", outbox, seat)
+    first_url = SessionStore("gemini").get("example-sender")["url"]
+    answer("gemini", "example-sender", "second", outbox, seat)
+
+    assert seat.conversations == 1
+    assert SessionStore("gemini").get("example-sender")["url"] == first_url
+    prompts = [text for role, text in seat.history if role == "user"]
+    assert len(prompts) == 3  # the preamble, then both messages
+    assert prompts[1:] == ["first", "second"]
+    assert "ack: second" in outbox.last
+
+
+def test_two_correspondents_get_two_conversations(seat, outbox, clock, state_home):
+    both = "example-sender,other"
+    answer("gemini", "example-sender", "hello", outbox, seat, allow=both)
+    answer("gemini", "other", "hello", outbox, seat, allow=both)
+
+    sessions = SessionStore("gemini").all()
+    assert seat.conversations == 2
+    assert sessions["example-sender"]["url"] != sessions["other"]["url"]
+
+
+def test_a_conversation_deleted_in_gemini_is_replaced_and_said_out_loud(
+    seat, outbox, clock, state_home
+):
+    SessionStore("gemini").remember("example-sender", "https://gemini.google.com/app/gone")
+    assert answer("gemini", "example-sender", "hello", outbox, seat) == 0
+
+    assert "not usable" in outbox.last
+    assert gemini.conversation_id(SessionStore("gemini").get("example-sender")["url"]) != "gone"
+    assert "ack: hello" in outbox.last
+
+
+def test_a_corrupt_store_costs_a_note_and_not_the_turn(seat, outbox, clock, state_home):
+    broken = SessionStore("gemini")
+    os.makedirs(broken.root, exist_ok=True)
+    with open(broken.path, "w") as handle:
+        handle.write("{ half a file")
+
+    assert answer("gemini", "example-sender", "hello", outbox, seat) == 0
+    assert "could not be read" in outbox.last
+    assert "ack: hello" in outbox.last
+    assert SessionStore("gemini").get("example-sender")
+
+
+def test_a_rate_limited_seat_says_so_and_does_not_retry(seat, outbox, clock, state_home):
+    seat.reply = lambda prompt: "You've reached your limit on messages. Try again later."
+    assert answer("gemini", "example-sender", "hello", outbox, seat) == 0
+
+    assert "rate-limiting" in outbox.last
+    assert "Retry later" in outbox.last
+    # the refusal answered the preamble, so the message was never typed in
+    prompts = [text for role, text in seat.history if role == "user"]
+    assert len(prompts) == 1
+    assert "hello" not in prompts[0]
+
+
+def test_a_reply_cut_short_by_the_timeout_says_so(seat, outbox, clock, state_home, monkeypatch):
+    monkeypatch.setattr(gemini, "TURN_TIMEOUT_SECONDS", 5.0)
+    seat.stream_polls = 99
+    assert answer("gemini", "example-sender", "hello", outbox, seat) == 0
+    assert "cut short" in outbox.last or "no reply appeared" in outbox.last
+
+
+def test_a_browser_that_cannot_be_driven_keeps_the_message(seat, outbox, clock, state_home):
+    seat.signed_in = False
+    assert answer("gemini", "example-sender", "hello", outbox, seat) == 1
+    assert "not signed in" in outbox.last
+
+
+class FlakySeat:
+    """A seat that stops answering right after the message is typed in."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.seat = inner.seat
+        self.sends = 0
+        self.dead = False
+
+    def run(self, script):
+        if self.dead:
+            raise browser.BrowserError("the browser went away")
+        answer = self.inner.run(script)
+        if self.inner.label in script.splitlines()[0]:
+            self.sends += 1
+            self.dead = self.sends == 2  # the preamble, then the message itself
+        return answer
+
+
+def test_a_failure_after_the_message_is_typed_does_not_ask_gemini_twice(
+    seat, outbox, clock, state_home
+):
+    code = answer("gemini", "example-sender", "hello", outbox, FlakySeat(seat))
+    assert code == 0  # a requeue here would type the same message in again
+    assert "went away" in outbox.last
+    assert [text for role, text in seat.history if role == "user"][-1] == "hello"
+
+
+def test_a_long_reply_is_cut_to_the_body_cap(seat, outbox, clock, state_home):
+    seat.reply = lambda prompt: "x" * 9000 if "hello" in prompt else "ready"
+    answer("gemini", "example-sender", "hello", outbox, seat)
+    assert len(outbox.last) <= handler.MAX_BODY
+    assert outbox.last.endswith("(cut at this seat's reply cap)")
+
+
+def test_geminis_own_trouble_wording_is_passed_on_as_a_note(seat, outbox, clock, state_home):
+    seat.reply = (
+        lambda prompt: "Sorry, I couldn't generate a response." if "hello" in prompt else "ready"
+    )
+    answer("gemini", "example-sender", "hello", outbox, seat)
+    assert "couldn't generate" in outbox.last
+    assert "trouble wording" in outbox.last
