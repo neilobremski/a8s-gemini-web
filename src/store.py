@@ -44,8 +44,11 @@ def state_root():
     return os.path.join(base, APP_DIR)
 
 
-class _Lock:
+class FileLock:
     """An exclusive lock on one path, with a bounded wait.
+
+    Shared with the pending outbox, which needs the same thing for the same
+    reason: a mutation two runs can both start is a mutation that loses work.
 
     flock is released when the file closes and when the process dies, so a run
     killed mid-turn does not leave the seat locked out.
@@ -105,7 +108,7 @@ def turn_lock(seat, root=None, timeout=0.0):
     cannot overlap.
     """
     root = root or state_root()
-    return _Lock(os.path.join(root, f".{seat}.turn.lock"), timeout=timeout)
+    return FileLock(os.path.join(root, f".{seat}.turn.lock"), timeout=timeout)
 
 
 class SessionStore:
@@ -189,7 +192,7 @@ class SessionStore:
         that run's work.
         """
         try:
-            with _Lock(self._lock_path, timeout=LOCK_WAIT_SECONDS):
+            with FileLock(self._lock_path, timeout=LOCK_WAIT_SECONDS):
                 sessions = self._read_file()
                 changed = change(sessions)
                 if changed:

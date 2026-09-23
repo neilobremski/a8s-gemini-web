@@ -7,6 +7,7 @@ what makes them worth keeping is the failure they describe.
 import json
 import os
 import stat
+import time
 
 import pytest
 from conftest import FakeGeminiSeat
@@ -16,6 +17,7 @@ import gemini
 import handler
 import outbox as outbox_module
 import store
+from store import FileLock
 
 
 def snapshot(*lines):
@@ -636,9 +638,16 @@ def test_a_claim_left_by_a_dead_run_comes_back(state_home, monkeypatch):
     held = outbox_module.Outbox("gemini", root)
     path = held.keep("someone", "abandoned")
     stranded = held._claim(path)
+    # A claim is invisible until it is old enough to be recovered, and only a
+    # flush recovers it — listing the queue has no side effects.
     assert held.waiting() == []
+    sent = []
+    assert held.flush(lambda to, body: sent.append((to, body)) or 0) == (0, 0)
+
     monkeypatch.setattr(outbox_module, "RECLAIM_SECONDS", -1.0)
-    assert held.waiting()[0][2] == "abandoned"
+    delivered, remaining = held.flush(lambda to, body: sent.append((to, body)) or 0)
+    assert (delivered, remaining) == (1, 0)
+    assert sent == [("someone", "abandoned")]
     assert not os.path.exists(stranded)
 
 
@@ -665,3 +674,92 @@ def test_a_sender_that_cannot_start_still_holds_the_reply(tmp_path, clock, state
     assert code == 0
     root = os.path.join(str(state_home), "a8s-gemini-web")
     assert len(outbox_module.Outbox("gemini", root).waiting()) == 1
+
+
+# --- third review: a claim must carry its own age, not the reply's -----------
+
+
+def test_an_old_reply_gets_a_claim_that_is_new(state_home):
+    """A rename keeps the file's mtime. The claim's age is not the reply's."""
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    path = held.keep("someone", "queued a long time ago")
+    stale = time.time() - (outbox_module.RECLAIM_SECONDS + 1)
+    os.utime(path, (stale, stale))
+
+    claimed = held._claim(path)
+    taken = held._claimed_at(os.path.basename(claimed))
+    assert taken is not None
+    assert time.time() - taken < 5
+    # The file it came from is older than the reclaim window; the claim is not.
+    assert time.time() - os.path.getmtime(claimed) > outbox_module.RECLAIM_SECONDS
+
+
+def test_an_aged_reply_is_not_delivered_twice_by_a_second_flusher(state_home):
+    """Carlos's case: a reply older than the reclaim window, claimed live.
+
+    With the age read off the file, the live claim was already expired, a
+    second flusher recovered it immediately, and the reply went out twice
+    while the first send was still running.
+    """
+    import threading
+
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    path = held.keep("someone", "waited over five minutes")
+    stale = time.time() - (outbox_module.RECLAIM_SECONDS + 1)
+    os.utime(path, (stale, stale))
+
+    inside = threading.Event()
+    release = threading.Event()
+    sent = []
+    guard = threading.Lock()
+
+    def slow(recipient, body):
+        with guard:
+            sent.append((recipient, body))
+        inside.set()
+        release.wait(timeout=5)
+        return 0
+
+    def quick(recipient, body):
+        with guard:
+            sent.append((recipient, body))
+        return 0
+
+    first = threading.Thread(target=held.flush, args=(slow,))
+    first.start()
+    assert inside.wait(timeout=5)
+    # A second run arrives while the first is mid-send.
+    assert held.flush(quick) == (0, 0)
+    release.set()
+    first.join(timeout=5)
+
+    assert len(sent) == 1
+    assert held.waiting() == []
+
+
+def test_a_second_flusher_leaves_the_queue_to_the_first(state_home):
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    held.keep("someone", "only copy")
+    with FileLock(held.lock_path):
+        assert held.flush(lambda to, body: 0) == (0, 1)
+    assert held.waiting()[0][2] == "only copy"
+
+
+def test_a_claim_with_no_readable_stamp_is_recovered(state_home):
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    path = held.keep("someone", "hand-edited claim")
+    os.rename(path, f"{path}{outbox_module.CLAIM}not-a-time")
+    sent = []
+    assert held.flush(lambda to, body: sent.append((to, body)) or 0) == (1, 0)
+    assert sent == [("someone", "hand-edited claim")]
+
+
+def test_flushing_an_empty_queue_takes_no_lock(state_home):
+    root = os.path.join(str(state_home), "a8s-gemini-web")
+    held = outbox_module.Outbox("gemini", root)
+    assert held.flush(lambda to, body: 0) == (0, 0)
+    assert not os.path.exists(held.lock_path)
