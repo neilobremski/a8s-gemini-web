@@ -8,7 +8,15 @@ It is small, it is JSON, and it is written whole: a turn either records the new
 conversation or it does not. A store that cannot be read is treated as empty
 and said out loud in the reply, because a wake that dies on its own bookkeeping
 loses the message it was woken for.
+
+**Every mutation reloads under an exclusive lock.** An atomic replace makes each
+write whole, which is not the same as making two writers safe: without the lock
+two runs both read the same map, each add their own correspondent, and the
+second replace erases the first one's conversation. That sender then gets a new
+chat with no memory, which is the exact failure this file exists to prevent.
 """
+import errno
+import fcntl
 import json
 import os
 import tempfile
@@ -16,11 +24,88 @@ import time
 
 APP_DIR = "a8s-gemini-web"
 
+# How long a mutation waits for another run's lock before giving up. Short: a
+# store write takes microseconds, so a wait this long means a run died holding
+# the file, and the caller has a sentence to say about it either way.
+LOCK_WAIT_SECONDS = 10.0
+
+
+class StoreError(Exception):
+    """The store could not be read or written — a disk or permission failure."""
+
+
+class Busy(Exception):
+    """Another run of this seat holds the lock."""
+
 
 def state_root():
     """Where sessions live, off the install directory an update replaces."""
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/share")
     return os.path.join(base, APP_DIR)
+
+
+class _Lock:
+    """An exclusive lock on one path, with a bounded wait.
+
+    flock is released when the file closes and when the process dies, so a run
+    killed mid-turn does not leave the seat locked out.
+    """
+
+    def __init__(self, path, timeout=0.0, poll=0.05):
+        self.path = path
+        self.timeout = timeout
+        self.poll = poll
+        self._handle = None
+
+    def __enter__(self):
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            self._handle = open(self.path, "a+")
+        except OSError as exc:
+            # The same failure the store itself has, one step earlier: a
+            # directory nobody can write. It gets the same sentence.
+            raise StoreError(f"the lock at {self.path} could not be opened: {exc}") from exc
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self._handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    self._close()
+                    raise StoreError(
+                        f"the lock at {self.path} could not be taken: {exc}"
+                    ) from exc
+                if time.monotonic() >= deadline:
+                    self._close()
+                    raise Busy(self.path) from None
+                time.sleep(self.poll)
+
+    def __exit__(self, *_):
+        self._close()
+        return False
+
+    def _close(self):
+        if self._handle is not None:
+            try:
+                fcntl.flock(self._handle, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            self._handle.close()
+            self._handle = None
+
+
+def turn_lock(seat, root=None, timeout=0.0):
+    """One turn at a time per seat.
+
+    The store is not the only state a turn shares: the browser seat is one
+    window, and two turns interleaved in it navigate away from each other's
+    conversation and collect each other's replies. This lock covers a whole
+    turn, from the first navigation to the reply, so a manual `ask` and a wake
+    cannot overlap.
+    """
+    root = root or state_root()
+    return _Lock(os.path.join(root, f".{seat}.turn.lock"), timeout=timeout)
 
 
 class SessionStore:
@@ -36,31 +121,42 @@ class SessionStore:
     def path(self):
         return os.path.join(self.root, f"{self.seat}.json")
 
-    def _load(self):
-        if self._sessions is not None:
-            return self._sessions
-        self._sessions = {}
+    @property
+    def _lock_path(self):
+        return os.path.join(self.root, f".{self.seat}.store.lock")
+
+    def _read_file(self):
+        """The stored map, or {} with `warning` set to why it is empty."""
         try:
             with open(self.path) as handle:
                 payload = json.load(handle)
         except FileNotFoundError:
-            return self._sessions
+            return {}
         except (OSError, ValueError) as exc:
             self.warning = (
                 f"the session store at {self.path} could not be read ({exc}); "
                 "this turn starts a fresh conversation"
             )
-            return self._sessions
+            return {}
         sessions = payload.get("sessions") if isinstance(payload, dict) else None
         if not isinstance(sessions, dict):
             self.warning = (
                 f"the session store at {self.path} is not in the expected shape; "
                 "this turn starts a fresh conversation"
             )
-            return self._sessions
-        self._sessions = {
-            name: entry for name, entry in sessions.items() if isinstance(entry, dict)
+            return {}
+        # An entry counts only when its url is a string. Anything else is a
+        # hand-edit or a foreign writer, and carrying it on would fail deep in
+        # the browser with a TypeError instead of here with a sentence.
+        return {
+            name: entry
+            for name, entry in sessions.items()
+            if isinstance(entry, dict) and isinstance(entry.get("url"), str)
         }
+
+    def _load(self):
+        if self._sessions is None:
+            self._sessions = self._read_file()
         return self._sessions
 
     def all(self):
@@ -70,34 +166,69 @@ class SessionStore:
         return self._load().get(sender.lower())
 
     def remember(self, sender, url):
-        sessions = self._load()
-        sessions[sender.lower()] = {
-            "url": url,
-            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        }
-        self._write(sessions)
+        def change(sessions):
+            sessions[sender.lower()] = {
+                "url": url,
+                "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+            return True
+
+        self._mutate(change)
 
     def forget(self, sender):
-        sessions = self._load()
-        if sessions.pop(sender.lower(), None) is None:
-            return False
-        self._write(sessions)
-        return True
+        def change(sessions):
+            return sessions.pop(sender.lower(), None) is not None
+
+        return self._mutate(change)
+
+    def _mutate(self, change):
+        """Reload, change, write — all inside the lock.
+
+        The reload is the point. Whatever this process cached is stale the
+        moment another run writes, and a change applied to a stale map deletes
+        that run's work.
+        """
+        try:
+            with _Lock(self._lock_path, timeout=LOCK_WAIT_SECONDS):
+                sessions = self._read_file()
+                changed = change(sessions)
+                if changed:
+                    self._write(sessions)
+                self._sessions = sessions
+                return changed
+        except Busy as exc:
+            raise StoreError(
+                f"another run of seat {self.seat!r} is holding the session store "
+                f"({exc}); nothing was changed"
+            ) from None
 
     def _write(self, sessions):
         """Whole-file, atomic: a half-written store is one nobody can read."""
-        os.makedirs(self.root, exist_ok=True)
-        handle = tempfile.NamedTemporaryFile(
-            "w", dir=self.root, prefix=f".{self.seat}-", suffix=".json", delete=False
-        )
+        try:
+            os.makedirs(self.root, exist_ok=True)
+            handle = tempfile.NamedTemporaryFile(
+                "w", dir=self.root, prefix=f".{self.seat}-", suffix=".json", delete=False
+            )
+        except OSError as exc:
+            raise StoreError(self._unwritable(exc)) from exc
         try:
             with handle:
                 json.dump({"sessions": sessions}, handle, indent=2, sort_keys=True)
                 handle.write("\n")
             os.replace(handle.name, self.path)
+        except OSError as exc:
+            self._discard(handle.name)
+            raise StoreError(self._unwritable(exc)) from exc
         except BaseException:
-            try:
-                os.unlink(handle.name)
-            except OSError:
-                pass
+            self._discard(handle.name)
             raise
+
+    def _unwritable(self, exc):
+        return f"the session store at {self.path} could not be written: {exc}"
+
+    @staticmethod
+    def _discard(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass

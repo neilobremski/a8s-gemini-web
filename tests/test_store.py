@@ -89,7 +89,8 @@ def test_a_missing_store_is_not_a_warning(state_home):
 def test_the_write_leaves_nothing_half_finished_behind(state_home):
     keeper = store.SessionStore("gemini")
     keeper.remember("example-sender", "https://gemini.google.com/app/abc")
-    written = os.listdir(keeper.root)
+    # The lock is a permanent fixture beside the store; a temp file is not.
+    written = sorted(name for name in os.listdir(keeper.root) if not name.endswith(".lock"))
     assert written == [os.path.basename(keeper.path)]
     with open(keeper.path) as handle:
         assert json.load(handle)["sessions"]["example-sender"]["url"].endswith("abc")

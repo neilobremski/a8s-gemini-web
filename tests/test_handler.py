@@ -1,25 +1,9 @@
 import os
 
-import pytest
-
 import browser
 import gemini
 import handler
 from store import SessionStore
-
-
-class Outbox:
-    """Every tell this seat sends, instead of the `tell` CLI."""
-
-    def __init__(self):
-        self.sent = []
-
-    def __call__(self, recipient, body):
-        self.sent.append((recipient, body))
-
-    @property
-    def last(self):
-        return self.sent[-1][1]
 
 
 class RefusedSeat:
@@ -29,11 +13,6 @@ class RefusedSeat:
 
     def run(self, script):
         raise AssertionError(f"the browser was driven for a refused sender:\n{script}")
-
-
-@pytest.fixture
-def outbox():
-    return Outbox()
 
 
 def answer(node, sender, message, outbox, runner, **kwargs):

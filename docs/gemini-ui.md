@@ -32,6 +32,7 @@ below, and put whatever it says now into the constant beside it.
 | `HISTORY_SELECTOR` | `main`, read with `text` as the fallback when the headings stop matching | reading |
 | `TRAILING_NOISE` | the page's own `Gemini is AI and can make mistakes.` line | observed 2026-09-23 |
 | `conversation_id` | a new chat is `/app` with no id; after the first message the URL becomes `/app/<hex id>`, and returning is a plain `go` to it | observed 2026-09-23 |
+| `MODEL_TURN_HEADING` / `USER_TURN_HEADING` as *turn* headings | only these two end a turn; a `Critical findings` heading inside an answer is the answer | observed 2026-09-23 |
 | `MODE_PICKER_PREFIX` | the model switcher is named `Open mode picker, currently <Model>`, so the current model is readable without opening anything | observed 2026-09-23 |
 | `MODEL_BUTTON_SELECTORS` | CSS for that switcher, `button[aria-label^="Open mode picker"]` first | derived from the observed name, **click untested** |
 | `RATE_LIMIT_PHRASES` | Gemini's own quota refusal, matched near the front of a short reply | reading, **untested** |
@@ -75,6 +76,23 @@ preamble, so the title is already about the correspondent.
 Note the same name appears twice on the page. `Show more options` in
 `COMPLETION_BUTTONS` is read from a snapshot as evidence a turn finished; it is
 never clicked.
+
+**How the message reaches the prompt box.** Not as a command argument.
+a8s-browser strips every script line before it parses it, so an indented code
+example arrives at column zero — a different program from the one the sender
+asked about — and any line ending in `<<WORD` is read as a block opener, which
+refuses the whole script. Each line of the message therefore travels as a
+`<<MARKER` block, whose content a8s-browser takes verbatim, one block per line
+because a `type` carrying a newline would press Enter and send the message
+half-written. `tests/test_browser_parser.py` checks that rule against
+a8s-browser's own parser when a checkout of it is reachable.
+
+**The seat's Chrome window has to be on screen.** a8s-browser restarts a Chrome
+whose `visibilityState` reads `hidden`, which on macOS is what a window behind
+other windows reports. Every command then gets a fresh `about:blank` and no
+page survives from one command to the next, so a turn fails with a composer
+that never appears. The driver names this case rather than blaming the
+selectors. Keep the seat's window visible — its own desktop or space is ideal.
 
 **Rate-limit wording.** Gemini's quota refusal has not been captured, so the
 phrases are a reading. They match only near the front of a short reply, because

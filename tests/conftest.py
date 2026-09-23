@@ -1,4 +1,5 @@
 import os
+import re
 import shlex
 import sys
 
@@ -9,25 +10,73 @@ import pytest
 import browser
 import gemini
 
-# Verbs a8s-browser hands the rest of the line to verbatim; everything else it
-# splits with shlex. Mirrored here so a generated script is parsed by the same
-# rules the real seat parses it by.
-RAW_ARGS = {"eval", "type", "find", "assert-text", "video-chapter", "dialog-accept"}
+# a8s-browser's own script rules, mirrored so a script this driver generates is
+# parsed here by the rules the real seat parses it by. Kept honest by
+# `tests/test_browser_parser.py`, which runs the real parser when a checkout of
+# a8s-browser is reachable and compares it against this one case by case.
+#
+# Verbs that take the rest of the line verbatim instead of shlex words:
+RAW_ARGS = {"eval", "run-code", "type", "find", "assert-text", "video-chapter", "dialog-accept"}
+
+# `<<MARKER` at the end of a line opens a block; the marker is the last word.
+HEREDOC = re.compile(r"^(?P<command>.*?)\s*<<\s*(?P<marker>\S+)$")
+
+
+class ScriptError(Exception):
+    """A script the seat refuses to parse — no step of it runs."""
+
+
+def script_commands(body):
+    """Commands of a script, each with the block it opened or None.
+
+    Every line is stripped before it is read, which is exactly why a message
+    cannot travel as an inline argument. A block's lines are taken verbatim:
+    no stripping, no comment rules, indentation kept.
+    """
+    parsed = []
+    lines = body.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        index += 1
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(("ATTACHED FILE:", "ATTACHMENT UNAVAILABLE:")):
+            continue
+        opener = HEREDOC.match(line)
+        command = opener.group("command").strip() if opener else ""
+        if not command:
+            parsed.append((line, None))
+            continue
+        if len(command.split()) > 1:
+            raise ScriptError(
+                "a line that opens a block cannot also carry an inline argument: " + line
+            )
+        marker = opener.group("marker")
+        block = []
+        for raw in lines[index:]:
+            index += 1
+            if raw.strip() == marker:
+                break
+            block.append(raw)
+        else:
+            raise ScriptError(f"unterminated <<{marker}: no line reads {marker}")
+        parsed.append((command, "\n".join(block)))
+    return parsed
 
 
 def parse_script(script):
-    """Parse a command script the way a8s-browser's `run_script` does."""
+    """One script as (verb, args, line) steps, the way a8s-browser runs it."""
     parsed = []
-    for raw in script.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
+    for line, block in script_commands(script):
         verb = line.split(None, 1)[0]
         if verb in RAW_ARGS:
             args = line.split(None, 1)[1:]
         else:
             words = shlex.split(line)
             verb, args = words[0], words[1:]
+        if block is not None:
+            args = [block]
         parsed.append((verb, args, line))
     return parsed
 
@@ -195,7 +244,7 @@ class FakeGeminiSeat:
             self.draft += "\n"
             return key
         if key == "Escape":
-                return key
+            return key
         if key != "Enter":
             return key
         prompt, self.draft = self.draft, ""
@@ -222,6 +271,25 @@ class FakeGeminiSeat:
             return ""
         body = "\n".join(text for _, text in self.history)
         return f"{body}\nGemini is AI and can make mistakes."
+
+
+class Outbox:
+    """Every tell this seat sends, instead of the `tell` CLI."""
+
+    def __init__(self):
+        self.sent = []
+
+    def __call__(self, recipient, body):
+        self.sent.append((recipient, body))
+
+    @property
+    def last(self):
+        return self.sent[-1][1]
+
+
+@pytest.fixture
+def outbox():
+    return Outbox()
 
 
 @pytest.fixture

@@ -49,6 +49,12 @@ TURN_TIMEOUT_SECONDS = 180.0
 # message. Gemini rewrites /app to /app/<id> once the turn is under way.
 URL_WAIT_SECONDS = 15.0
 
+# How long the prompt box is given to appear. Gemini is a single-page app: a
+# navigation resolves long before the composer exists, and a snapshot taken in
+# that window has no textbox in it at all. Failing there would throw away a
+# message because a page was slow, which cost a live turn on 2026-09-23.
+PROMPT_WAIT_SECONDS = 20.0
+
 # The prompt box is a textbox in the snapshot, preferring one whose name says
 # what it is for. It is a Quill editor rather than a real textarea, so it is
 # reached by its accessible name and never by textarea semantics.
@@ -72,7 +78,17 @@ TEXT_ROLES = ("paragraph", "text", "listitem", "code", "blockquote", "cell", "li
 # carries a copy button of its own, and stopping there would cut the reply in
 # half. The prompt box is what actually sits below the last turn, which is also
 # what keeps the page's own disclaimer out of a reply that is still streaming.
-STOP_ROLES = ("heading", "textbox", "contentinfo", "form", "navigation", "banner")
+#
+# Neither does a heading, on its own. Gemini writes structured answers, and
+# their section headings are the reply — stopping at the first one returns the
+# introductory sentence and throws away everything the sender asked for. Only a
+# *turn* heading ends a turn, which is the pair below.
+STOP_ROLES = ("textbox", "contentinfo", "form", "navigation", "banner")
+
+# a8s-browser's heredoc marker for the message text. It is this driver's choice
+# rather than the page's: any word works, and `_block_marker` lengthens it if a
+# line of the message happens to read exactly like it.
+BLOCK_MARKER = "A8SGW"
 
 # The whole conversation as rendered text, used when the headings stop matching
 # — the reply is then whatever follows the message just sent.
@@ -131,23 +147,41 @@ class GeminiError(Exception):
     """The page did not look the way this module expects."""
 
 
-class Reading:
-    """One look at the conversation: the newest reply, and whether the page
-    says that reply is finished."""
+class SendUncertain(GeminiError):
+    """The send failed at or after the keystroke that submits the message.
 
-    def __init__(self, text, complete):
+    The difference matters more than it looks. A failure *before* Enter means
+    the message is definitely not in the conversation and the caller should
+    keep it and try again. A failure at Enter, or a seat that stopped answering
+    altogether, means nobody here knows — and retrying on that guess asks
+    Gemini the same question twice, in the same chat, as though the sender had
+    said it twice. The caller reconciles against the page instead of guessing.
+    """
+
+
+class Reading:
+    """One look at the conversation.
+
+    `counts` is (user turns, model turns) as the page's own headings report
+    them, or None when no heading matched — that is what tells a new reply from
+    the one that was already there, without comparing text.
+    """
+
+    def __init__(self, text, complete, counts=None):
         self.text = text
         self.complete = complete
+        self.counts = counts
 
 
 class Turn:
     """The outcome of one message: the reply, and whether it finished."""
 
-    def __init__(self, reply, complete, seconds, note=""):
+    def __init__(self, reply, complete, seconds, note="", counts=None):
         self.reply = reply
         self.complete = complete
         self.seconds = seconds
         self.note = note
+        self.counts = counts
 
 
 def _now():
@@ -179,22 +213,48 @@ def poll_script():
     return f"snap\ntext {shlex.quote(HISTORY_SELECTOR)}"
 
 
+def _block_marker(lines):
+    """A heredoc marker no line of the message can be mistaken for."""
+    marker = BLOCK_MARKER
+    taken = {line.strip() for line in lines}
+    while marker in taken:
+        marker += "X"
+    return marker
+
+
 def send_script(label, message):
     """The script that types one message and sends it.
 
-    A command script is one command per line, so a multi-line message cannot be
-    a single `fill`. The first line fills the box — which focuses it — and each
-    further line is a newline keystroke plus a `type`, whose argument
-    a8s-browser takes verbatim; that is what carries an apostrophe or a quote
-    through unharmed. The first line goes through `shlex.quote` for the same
-    reason. Sending is Enter straight after, which is b3t's proven move.
+    **The message never appears as a command-line argument.** a8s-browser
+    strips every script line before it parses it, so text passed inline loses
+    its indentation — an indented code example arrives at column zero, which is
+    a different program from the one the sender asked about. Worse, any line
+    ending in `<<WORD` reads as a block opener and the whole script is refused,
+    so a message that merely mentions a heredoc could not be sent at all.
+
+    Each line therefore travels as a `<<MARKER` block, whose content a8s-browser
+    takes verbatim: no stripping, no quoting, no comment rules. One block per
+    line, because a `type` carrying a newline would press Enter and submit the
+    message half-written; the line break is `Shift+Enter`, which Gemini treats
+    as a new line inside the prompt.
+
+    The box is emptied first, which also focuses it — a leftover draft in the
+    prompt box would otherwise be sent along with the message. Sending is Enter
+    straight after, which is b3t's proven move.
     """
+    if "<<" in label:
+        raise GeminiError(
+            f"the prompt box's name ({label!r}) contains '<<', which a8s-browser reads "
+            "as a block opener. Give this seat a CSS selector for the prompt box instead."
+        )
     lines = message.splitlines() or [""]
-    script = [f"fill {shlex.quote(label)} {shlex.quote(lines[0])}"]
-    for line in lines[1:]:
-        script.append("press Shift+Enter")
-        if line.strip():
-            script.append(f"type {line.strip()}")
+    marker = _block_marker(lines)
+    script = [f"fill {shlex.quote(label)} ''"]
+    for index, line in enumerate(lines):
+        if index:
+            script.append("press Shift+Enter")
+        if line:
+            script.append(f"type <<{marker}\n{line}\n{marker}")
     script.append("press Enter")
     return "\n".join(script)
 
@@ -231,11 +291,48 @@ def current_model(snapshot):
     return ""
 
 
+def turn_heading(role, name):
+    """Which turn a heading opens: "model", "user", or "" for a content heading.
+
+    The distinction is the whole of R1: a level-2 `Critical findings` inside an
+    answer is text, and only `Gemini said` / `You said` divide one turn from
+    the next.
+    """
+    if role != "heading":
+        return ""
+    if name == MODEL_TURN_HEADING:
+        return "model"
+    if name.startswith(USER_TURN_HEADING):
+        return "user"
+    return ""
+
+
+def turn_counts(snapshot):
+    """How many turns each side has taken, or None when no heading matches.
+
+    This is what identifies a turn. Text cannot: an agent relay answers `OK`
+    all day, and a second `OK` is a new reply rather than the old one still on
+    screen. None means the headings have changed shape and the caller has to
+    fall back to comparing text, which is the weaker rule and known to be.
+    """
+    asked = answered = 0
+    for line in snapshot.splitlines():
+        role, name, _ = node(line)
+        which = turn_heading(role, name)
+        if which == "model":
+            answered += 1
+        elif which == "user":
+            asked += 1
+    if not asked and not answered:
+        return None
+    return asked, answered
+
+
 def _last_model_turn(lines):
     found = -1
     for index, line in enumerate(lines):
         role, name, _ = node(line)
-        if role == "heading" and name == MODEL_TURN_HEADING:
+        if turn_heading(role, name) == "model":
             found = index
     return found
 
@@ -254,14 +351,22 @@ def reply_block(snapshot):
     collected = []
     for line in lines[start + 1:]:
         role, name, value = node(line)
+        if turn_heading(role, name):
+            break
         if role in STOP_ROLES:
             break
         if role == "button" and name in COMPLETION_BUTTONS:
             break
-        if role in TEXT_ROLES:
+        if role == "heading":
+            # A section heading inside the answer. It is part of what Gemini
+            # wrote, and dropping it would run two sections together.
+            text = name or value
+        elif role in TEXT_ROLES:
             text = value or name
-            if text:
-                collected.append(text)
+        else:
+            continue
+        if text:
+            collected.append(text)
     return "\n".join(collected).strip()
 
 
@@ -428,6 +533,52 @@ def prompt_label(snapshot, seat=""):
     return label
 
 
+BLANK_PAGE = "about:blank"
+
+
+def _no_prompt(browser, snapshot):
+    """Why the composer is missing, with the likely cause named.
+
+    A blank page after a navigation that reported the app's own URL means the
+    page did not survive between two commands, and the way that happens is
+    a8s-browser cycling Chrome: it restarts a browser whose `visibilityState`
+    is "hidden", which a window behind other windows reports on macOS. Every
+    command then gets a fresh `about:blank`, and no driver can work across
+    calls. Saying so beats another sentence about selectors.
+    """
+    seat = browser.seat or "<seat>"
+    if not snapshot.strip() or BLANK_PAGE in snapshot:
+        return (
+            f"the seat landed on {BLANK_PAGE} straight after opening Gemini, so the page "
+            "is not surviving between commands. a8s-browser restarts a Chrome whose "
+            "window reports itself hidden, which is what an occluded or minimised "
+            f"window does. Bring seat {seat!r}'s Chrome window to the front and try again."
+        )
+    return (
+        f"no textbox in the page snapshot after {PROMPT_WAIT_SECONDS:.0f}s — Gemini's "
+        f"prompt box never appeared (it is normally named {PROMPT_FALLBACK_LABEL!r}). "
+        f"`a8s-browser -s {seat} snap` shows the page now."
+    )
+
+
+def await_prompt(browser, now=None, sleep=None):
+    """The prompt box's label and the snapshot it was read from, waited for.
+
+    Returns as soon as the composer exists. If it never does, this raises the
+    same sentence `prompt_label` would, naming the seat to snapshot by hand.
+    """
+    now, sleep = now or _now, sleep or _sleep
+    deadline = now() + PROMPT_WAIT_SECONDS
+    while True:
+        snapshot = page_snapshot(browser)
+        label = textbox_label(snapshot)
+        if label:
+            return label, snapshot
+        if now() >= deadline:
+            raise GeminiError(_no_prompt(browser, snapshot))
+        sleep(POLL_SECONDS)
+
+
 def conversation_url(browser, now=None, sleep=None):
     """The conversation's own URL, waited for until Gemini assigns one."""
     now, sleep = now or _now, sleep or _sleep
@@ -449,25 +600,44 @@ def read(browser, sent=""):
     transcript = _run(browser, poll_script(), "reading the conversation")
     snapshot = _snapshot_of(transcript, browser)
     history = _first_output(transcript, "text")
-    return Reading(extract_reply(snapshot, history, sent), turn_complete(snapshot))
+    return Reading(
+        extract_reply(snapshot, history, sent),
+        turn_complete(snapshot),
+        turn_counts(snapshot),
+    )
 
 
-def await_reply(browser, sent, baseline="", now=None, sleep=None):
+def is_new(reading, baseline="", baseline_counts=None):
+    """Whether this reading shows a reply that was not there before the send.
+
+    Counting the page's turn headings is the strong answer, and it is right
+    even when the new reply reads exactly like the old one — `OK` after `OK` is
+    two turns, not one. Comparing text is the fallback for a page whose
+    headings changed shape, and it is wrong in precisely that case, which is
+    why it is second.
+    """
+    if reading.counts and baseline_counts:
+        return reading.counts[1] > baseline_counts[1]
+    return bool(reading.text) and reading.text != baseline
+
+
+def await_reply(browser, sent, baseline="", baseline_counts=None, now=None, sleep=None):
     """Wait for the turn Gemini is writing to finish, and return it.
 
     Finished means the page says so, or — if those labels have changed — that
-    the text has not moved for SETTLE_SECONDS. `baseline` is the reply that was
-    already on the page before this message went in: text that still equals it
-    is the previous turn, not this one, which is also how a message that never
-    reached the prompt box is caught instead of answered with the last reply.
+    the text has not moved for SETTLE_SECONDS. What counts as *this* turn's
+    reply is `is_new`: the page's turn count moved, or, failing that, the text
+    is no longer the `baseline` that was on screen before the message went in.
     """
     now, sleep = now or _now, sleep or _sleep
     started = now()
     last = ""
+    counts = baseline_counts
     stable_since = None
     while True:
         reading = read(browser, sent)
-        text = reading.text if reading.text and reading.text != baseline else ""
+        counts = reading.counts or counts
+        text = reading.text if is_new(reading, baseline, baseline_counts) else ""
         if text and text == last:
             if stable_since is None:
                 stable_since = now()
@@ -475,7 +645,7 @@ def await_reply(browser, sent, baseline="", now=None, sleep=None):
             stable_since = None
             last = text
         if text and reading.complete:
-            return Turn(text, True, now() - started)
+            return Turn(text, True, now() - started, counts=counts)
         if text and stable_since is not None and now() - stable_since >= SETTLE_SECONDS:
             return Turn(
                 text,
@@ -483,6 +653,7 @@ def await_reply(browser, sent, baseline="", now=None, sleep=None):
                 now() - started,
                 "the page never marked this turn finished; it is being reported because "
                 "the text stopped changing.",
+                counts=counts,
             )
         elapsed = now() - started
         if elapsed >= TURN_TIMEOUT_SECONDS:
@@ -497,17 +668,52 @@ def await_reply(browser, sent, baseline="", now=None, sleep=None):
                     "reached Gemini's prompt box, or the turn headings in gemini.py no "
                     "longer match the page."
                 )
-            return Turn(last, False, elapsed, note)
+            return Turn(last, False, elapsed, note, counts=counts)
         sleep(POLL_SECONDS)
 
 
+SUBMIT_STEP = "press Enter"
+
+
+def _failed_step(transcript):
+    for step in transcript.steps:
+        if not step.get("ok"):
+            return step
+    return None
+
+
 def send(browser, label, message):
-    _run(browser, send_script(label, message), "typing the message into Gemini")
+    """Type the message and submit it, or say which of those is not known.
+
+    a8s-browser stops a script at its first failed step and reports which one,
+    and the submitting keystroke is the last step. So a named failure on any
+    earlier step is proof the message was never submitted, while a failure on
+    the keystroke itself — or a seat that returned no transcript at all — is
+    genuinely unknown and is raised as `SendUncertain`.
+    """
+    script = send_script(label, message)
+    try:
+        transcript = browser.run(script)
+    except BrowserError as exc:
+        raise SendUncertain(
+            f"typing the message into Gemini: {exc}. The seat never answered, so "
+            "whether the message was submitted cannot be told from here."
+        ) from exc
+    if transcript.ok:
+        return
+    failed = _failed_step(transcript) or {}
+    if str(failed.get("command") or "").strip() == SUBMIT_STEP:
+        raise SendUncertain(
+            f"typing the message into Gemini: {transcript.error}. That failure is on "
+            "the keystroke that sends, so whether Gemini received the message cannot "
+            "be told from here."
+        )
+    raise GeminiError(f"typing the message into Gemini: {transcript.error}")
 
 
-def send_turn(browser, label, message, baseline="", now=None, sleep=None):
+def send_turn(browser, label, message, baseline="", baseline_counts=None, now=None, sleep=None):
     send(browser, label, message)
-    return await_reply(browser, message, baseline, now=now, sleep=sleep)
+    return await_reply(browser, message, baseline, baseline_counts, now=now, sleep=sleep)
 
 
 def _dismiss_menu(browser):
