@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shlex
@@ -145,11 +146,15 @@ class FakeGeminiSeat:
         self.ids = set()
         self.clickable = {
             gemini.MODEL_BUTTON_SELECTORS[0],
+            gemini.UPLOAD_MENU_SELECTOR,
         }
+        # Gemini's upload menu and the file chooser its `Upload files` opens.
+        self.menu_open = False
+        self.chooser_open = False
         # Files in the composer, as chips the page would render.
         self.attached = []
-        # A drop that raises Gemini's first-upload disclaimer instead of taking
-        # the file, which is what the live page does on a fresh profile.
+        # An upload that raises Gemini's first-upload disclaimer instead of
+        # opening the chooser, which is what a fresh profile does.
         self.consent_needed = False
         self.consent_open = False
         # Snaps an upload takes to show up, so the wait itself is exercised.
@@ -163,6 +168,18 @@ class FakeGeminiSeat:
         # cannot be established either way.
         self.send_button = True
         self._pending_uploads = []
+        # Images the next model turn generates, as (filename, bytes).
+        self.next_images = []
+        # Images per model turn, keyed by that turn's index in `history`.
+        self.turn_images = {}
+        # Snaps an image stays drawn without its download control, with the
+        # rating cluster already showing — the worst case the page could have.
+        self.image_pending_polls = 0
+        # 1-based image numbers whose download fails in the browser.
+        self.download_fails = set()
+        # Rendered text as a8s-browser's `text` really returns it: a JSON string
+        # literal with its quotes taken off, so a line break is backslash-n.
+        self.escaped_text = False
 
     def run(self, script):
         self.scripts.append(script)
@@ -212,7 +229,15 @@ class FakeGeminiSeat:
             lines.append('  - button "Agree (Closes dialog box and gives disclaimer)" [ref=e5]')
         pending = False
         for name in self.attached:
-            lines.append(f'  - button "Remove {name}" [ref=e6]')
+            # The live chip (2026-09-24): the extension in capitals, then the
+            # name without it. The full filename is not in it.
+            ext = os.path.splitext(name)[1]
+            stem = gemini.chip_label(name)
+            lines += [
+                "  - generic [ref=e6] [cursor=pointer]:",
+                f"    - generic [ref=e6a]: {ext.lstrip('.').upper()}",
+                f"    - generic [ref=e6b]: {stem}",
+            ]
         if self.attached and self.upload_pending_polls > 0:
             # The chip is there and the upload is not done. Deliberately static:
             # two identical snapshots must not read as a finished upload.
@@ -233,6 +258,11 @@ class FakeGeminiSeat:
             shown, done = (text, True) if not last else self._visible_reply(text)
             lines.append(f'  - heading "{gemini.MODEL_TURN_HEADING}" [level=6] [ref={ref}]')
             lines += [f"  - paragraph: {line}" for line in shown.splitlines() if line.strip()]
+            images = self.turn_images.get(index, [])
+            drawing = bool(last and images and self.image_pending_polls > 0)
+            if drawing:
+                self.image_pending_polls -= 1
+            lines += self._image_lines(images, ref, drawing)
             if done:
                 lines += [
                     f'  - button "{label}" [ref={ref}{n}]'
@@ -247,32 +277,68 @@ class FakeGeminiSeat:
         lines.append("  - paragraph: Gemini is AI and can make mistakes.")
         return "\n".join(lines) + "\n"
 
-    def _do_drop(self, args):
-        """Files dropped onto an element, as playwright-cli's `drop` does.
+    @staticmethod
+    def _image_lines(images, ref, pending):
+        """Generated images in the shape the live page draws them (2026-09-24)."""
+        lines = []
+        for number, _ in enumerate(images, 1):
+            lines += [
+                f"  - generic [ref={ref}i{number}]:",
+                f"    - button [ref={ref}t{number}] [cursor=pointer]:",
+                f"      - img [ref={ref}p{number}]",
+            ]
+            if pending:
+                continue
+            lines += [
+                f"    - generic [ref={ref}c{number}]:",
+                f'      - button "Share image" [ref={ref}s{number}] [cursor=pointer]:',
+                f"        - img [ref={ref}s{number}i]: share_1",
+                f'      - button "Copy image" [ref={ref}y{number}] [cursor=pointer]:',
+                f"        - img [ref={ref}y{number}i]: content_copy",
+                f'      - button "{gemini.IMAGE_DOWNLOAD_NAME}" [ref={ref}d{number}]'
+                " [cursor=pointer]:",
+                f"        - img [ref={ref}d{number}i]: download",
+            ]
+        return lines
 
-        a8s-browser turns `drop <target> <path> ...` into one `--path` per file;
-        the driver builds the same line, so this takes the driver's form.
-        """
-        if not args or len(args) < 2:
-            raise StepFailed("usage: drop <target> <path> [<path> ...]")
-        if args[0] != gemini.COMPOSER_SELECTOR:
-            raise StepFailed(f"drop: nothing matching {args[0]!r}")
-        for path in args[1:]:
-            if not os.path.isfile(path):
-                raise StepFailed(f"drop: no such file: {path}")
-        if self.consent_needed:
-            # The page asks a person to accept its disclaimer; the file waits.
-            self.consent_open = True
-            return args[0]
-        self._pending_uploads += [os.path.basename(path) for path in args[1:]]
-        return args[0]
+    def _do_download(self, args):
+        """a8s-browser's `download`: click the target, save what came back as an artifact."""
+        match = re.search(r":nth-child\((\d+) of ", args[0])
+        newest = max(self.turn_images, default=None)
+        images = self.turn_images.get(newest, []) if newest == len(self.history) - 1 else []
+        if not match or not args[0].startswith(gemini.NEWEST_EXCHANGE_SELECTOR):
+            raise StepFailed(f"click: nothing visible matching {args[0]!r}")
+        number = int(match.group(1))
+        if number > len(images):
+            raise StepFailed(f"click: selector {args[0]!r} matched nothing visible and enabled")
+        if number in self.download_fails:
+            raise StepFailed(f"download: {args[0]} produced no download within 60s")
+        name, data = images[number - 1]
+        folder = os.path.join(str(self.tmp_path), "artifacts")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"20260924T074500-{name}")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def _do_upload(self, args):
+        """a8s-browser's `upload`: answer an open file chooser with one path."""
+        if len(args) != 1:
+            raise StepFailed("upload takes one file")
+        if not self.chooser_open:
+            raise StepFailed("upload: no file chooser is open")
+        if not os.path.isfile(args[0]):
+            raise StepFailed(f"upload: no such file: {args[0]}")
+        self.chooser_open = False
+        self._pending_uploads.append(os.path.basename(args[0]))
+        return os.path.basename(args[0])
 
     def _do_go(self, args):
         if not self.signed_in:
             self.url = "https://accounts.google.com/signin/v2/identifier"
             return self.url
         wanted = gemini.conversation_id(args[0])
-        # A conversation deleted in Gemini lands back on the bare app.
+        # A conversation that cannot be opened lands back on the bare app.
         self.url = args[0] if (not wanted or wanted in self.ids) else gemini.APP_URL
         if not gemini.conversation_id(self.url):
             self.history = []
@@ -307,12 +373,17 @@ class FakeGeminiSeat:
             self.draft += "\n"
             return key
         if key == "Escape":
+            self.menu_open = False
+            self.clickable.discard(gemini.UPLOAD_MENU_ITEM)
             return key
         if key != "Enter":
             return key
         prompt, self.draft = self.draft, ""
         self.history.append(("user", prompt))
         self.history.append(("model", self.reply(prompt)))
+        if self.next_images:
+            self.turn_images[len(self.history) - 1] = self.next_images
+            self.next_images = []
         if not gemini.conversation_id(self.url):
             self.conversations += 1
             self.url = f"{gemini.APP_URL}/c{self.conversations:04d}ab"
@@ -323,7 +394,18 @@ class FakeGeminiSeat:
         target = args[0]
         if target not in self.clickable:
             raise StepFailed(f"click: nothing visible matching {target!r}")
-        if target in gemini.MODEL_BUTTON_SELECTORS:
+        if target == gemini.UPLOAD_MENU_SELECTOR:
+            self.menu_open = True
+            self.clickable.add(gemini.UPLOAD_MENU_ITEM)
+        elif target == gemini.UPLOAD_MENU_ITEM:
+            self.menu_open = False
+            self.clickable.discard(gemini.UPLOAD_MENU_ITEM)
+            if self.consent_needed:
+                # The page asks a person to accept its disclaimer; no chooser.
+                self.consent_open = True
+            else:
+                self.chooser_open = True
+        elif target in gemini.MODEL_BUTTON_SELECTORS:
             self.clickable |= {"Pro", "Flash"}
         elif target in ("Pro", "Flash"):
             self.model = target
@@ -333,7 +415,8 @@ class FakeGeminiSeat:
         if args[0] != gemini.HISTORY_SELECTOR:
             return ""
         body = "\n".join(text for _, text in self.history)
-        return f"{body}\nGemini is AI and can make mistakes."
+        body = f"{body}\nGemini is AI and can make mistakes."
+        return json.dumps(body)[1:-1] if self.escaped_text else body
 
 
 class Outbox:

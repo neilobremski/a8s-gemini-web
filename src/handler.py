@@ -42,6 +42,10 @@ MAX_BODY = 4000
 # message text, so it is not what the cap is protecting against.
 LONG_REPLY_NAME = "gemini-reply.md"
 
+# Where a turn's generated images are copied before they are attached, inside
+# the turn's own work directory.
+OUTBOUND_DIR = "out"
+
 # Body room given back when the whole reply travels as a file. `_compose` caps
 # the body and its notes together, so an excerpt that fills the cap exactly
 # would push out the note saying where the rest of the answer went.
@@ -364,7 +368,38 @@ def _turn(seat, sender, message, runner, store, model, send, outbox):
     hit = gemini.trouble(turn.reply)
     if hit:
         notes.append(f"Gemini's own trouble wording is in this reply ({hit!r}).")
-    reply = turn.reply.strip() or f"{seat}: nothing came back from Gemini for this message."
+    images, lost = _fetch_images(runner, turn.images, work_dir)
+    notes.extend(lost)
+    reply = turn.reply.strip() or _images_line(turn.images, images) or (
+        f"{seat}: nothing came back from Gemini for this message."
+    )
     body, files = _as_body_and_files(reply, notes, work_dir)
-    _deliver(send, outbox, sender, _compose(body, notes), files)
+    _deliver(send, outbox, sender, _compose(body, notes), files + images)
     return 0
+
+
+def _fetch_images(runner, count, work_dir):
+    """Download a turn's generated images into this turn's own directory.
+
+    a8s-browser saves a download among its own artifacts, which are its to
+    sweep, so each file is copied into a directory this driver owns for the
+    turn before it is attached. Returns `(paths, notes)`, a note naming each
+    image that did not come back.
+    """
+    if not count:
+        return [], []
+    sources, failures = gemini.download_images(runner, count)
+    kept, lost = attachments.adopt(
+        sources, os.path.join(work_dir, OUTBOUND_DIR), taken={LONG_REPLY_NAME}
+    )
+    return kept, failures + lost
+
+
+def _images_line(made, attached):
+    """What an image-only answer says in words, since Gemini wrote none."""
+    if not made:
+        return ""
+    noun = "image" if made == 1 else "images"
+    if len(attached) == made:
+        return f"Generated {made} {noun}."
+    return f"Gemini generated {made} {noun}; {len(attached)} attached."

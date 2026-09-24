@@ -124,6 +124,42 @@ def read(message, work_dir):
     return Incoming(prose, whole, notes)
 
 
+# a8s-browser names an artifact `<YYYYMMDDTHHMMSS>-<name>`. The stamp is its
+# bookkeeping, not part of the file the page handed over.
+ARTIFACT_STAMP = re.compile(r"^\d{8}T\d{6}-")
+
+
+def adopt(sources, directory, taken=()):
+    """Copy files this seat is about to send into a directory it owns.
+
+    Returns `(paths, notes)`. Each name is reduced by `safe_name`, because it
+    came from a web page and will land on the sender's disk, and made unique
+    within the directory and against `taken` — two images Gemini names alike
+    must arrive as two files. A file that cannot be copied is named in a note
+    rather than dropped.
+    """
+    used = {name.lower() for name in taken}
+    paths = []
+    notes = []
+    for index, source in enumerate(sources, 1):
+        name = safe_name(ARTIFACT_STAMP.sub("", os.path.basename(source)), f"image-{index}")
+        stem, ext = os.path.splitext(name)
+        candidate, bump = name, 1
+        while candidate.lower() in used:
+            bump += 1
+            candidate = f"{stem}-{bump}{ext}"
+        try:
+            os.makedirs(directory, exist_ok=True)
+            target = os.path.join(directory, candidate)
+            shutil.copyfile(source, target)
+        except OSError as exc:
+            notes.append(f"{candidate} was downloaded but could not be kept for sending ({exc}).")
+            continue
+        used.add(candidate.lower())
+        paths.append(target)
+    return paths, notes
+
+
 def safe_name(name, fallback=FALLBACK_NAME):
     """A name reduced to one path segment that cannot escape its directory.
 

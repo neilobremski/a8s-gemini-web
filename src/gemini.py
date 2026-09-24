@@ -12,8 +12,10 @@ Two sources, both named in that doc:
 *Observed on the live interface, 2026-09-23, through `a8s-browser snap`* — the
 prompt box's name, that a new chat has no id until the first message is sent,
 the `You said` / `Gemini said` headings that separate the turns, the button
-cluster that marks a finished reply, and the mode picker's name. The interface
-changes without notice, so these are current readings and not constants.
+cluster that marks a finished reply, and the mode picker's name. On 2026-09-24:
+the upload menu and its chip, a generated image and its download control. The
+interface changes without notice, so these are current readings and not
+constants.
 
 *From b3t* (`apps/b3t/gemini.py` in `neilobremski/bin`, which drives Gemini Web
 through playwright-cli today) — the app URL, the sign-in check, finding the
@@ -25,6 +27,8 @@ Unverified and best effort: naming a conversation after its correspondent, and
 selecting a model. Both are non-fatal by design — a turn that cannot rename or
 cannot switch models still delivers its reply.
 """
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -86,11 +90,18 @@ TEXT_ROLES = ("paragraph", "text", "listitem", "code", "blockquote", "cell", "li
 # *turn* heading ends a turn, which is the pair below.
 STOP_ROLES = ("textbox", "contentinfo", "form", "navigation", "banner")
 
-# The composer, as a selector rather than an accessible name, because `drop`
-# addresses an element and the box is a Quill editor. `div[contenteditable=true]`
-# on its own matches two elements — Quill keeps a hidden clipboard node — and
-# Playwright refuses an ambiguous target, so the editor class is part of it.
-COMPOSER_SELECTOR = 'div.ql-editor[contenteditable="true"]'
+# A file goes in through Gemini's own upload flow: the composer's `Upload &
+# tools` button opens a menu, its `Upload files` item opens the operating
+# system's file chooser, and a8s-browser's `upload` answers the chooser with one
+# path. One file per chooser, so the menu is opened once per file. The button is
+# addressed by CSS because a selector click is a real Playwright click, which
+# this Angular menu answers; the item is addressed by its visible text.
+#
+# A synthetic `drop` does not work here. On the live page (2026-09-24) a drop
+# onto the Quill editor and a drop onto Gemini's own dropzone container both
+# ran without error and attached nothing: no chip, no filename, no progress.
+UPLOAD_MENU_SELECTOR = 'button[aria-label="Upload & tools"]'
+UPLOAD_MENU_ITEM = "Upload files"
 
 # The composer's own send control, and the only positive readiness evidence this
 # driver has. It does not exist while the prompt box is empty, and a snapshot
@@ -120,6 +131,26 @@ BLOCK_MARKER = "A8SGW"
 HISTORY_SELECTOR = "main"
 # Page furniture that rendered text picks up after the last reply.
 TRAILING_NOISE = ("Gemini is AI and can make mistakes", *COMPLETION_BUTTONS)
+
+# A generated image, as the live page renders it inside a model turn: an
+# unnamed button wrapping an unnamed img, then that image's own controls. The
+# download control is the one that matters. It is per image, and an image turn
+# counts as finished only when every image has one — the rating cluster alone
+# is not trusted to wait for the pixels.
+IMAGE_DOWNLOAD_NAME = "Download full size image"
+IMAGE_CONTROL_NAMES = ("Share image", "Copy image", IMAGE_DOWNLOAD_NAME)
+
+# The same control as an element, for a8s-browser's `download`, which takes a
+# CSS selector and acts on the first visible match. The page keeps every older
+# turn, and older turns carry download buttons too, so the selector is scoped
+# to the newest exchange: the conversation container with no container after
+# it. Within the turn, images are counted among the siblings that hold one.
+NEWEST_EXCHANGE_SELECTOR = "div.conversation-container:not(:has(~ div.conversation-container))"
+IMAGE_DOWNLOAD_SELECTOR = f'button[aria-label="{IMAGE_DOWNLOAD_NAME}"]'
+IMAGE_GROUP_SELECTOR = "div.generated-images"
+
+# How long one image's download is given, in a8s-browser's own units.
+DOWNLOAD_WAIT_SECONDS = 60
 
 # Gemini answers a burst with a quota refusal of its own, which arrives as a
 # reply like any other and has to be recognised rather than relayed as an
@@ -190,23 +221,34 @@ class Reading:
     `counts` is (user turns, model turns) as the page's own headings report
     them, or None when no heading matched — that is what tells a new reply from
     the one that was already there, without comparing text.
+
+    `images` is `image_readiness` for the newest model turn, and `image_count`
+    how many of its images can be downloaded now.
     """
 
-    def __init__(self, text, complete, counts=None):
+    def __init__(self, text, complete, counts=None, images=None, image_count=0):
         self.text = text
         self.complete = complete
         self.counts = counts
+        self.images = images
+        self.image_count = image_count
 
 
 class Turn:
-    """The outcome of one message: the reply, and whether it finished."""
+    """The outcome of one message: the reply, and whether it finished.
 
-    def __init__(self, reply, complete, seconds, note="", counts=None):
+    `images` is how many generated images the turn holds that are ready to be
+    downloaded. It can be nonzero with an empty `reply`: an image-only answer
+    is an answer.
+    """
+
+    def __init__(self, reply, complete, seconds, note="", counts=None, images=0):
         self.reply = reply
         self.complete = complete
         self.seconds = seconds
         self.note = note
         self.counts = counts
+        self.images = images
 
 
 def _now():
@@ -217,6 +259,21 @@ def _sleep(seconds):
     time.sleep(seconds)
 
 
+def _unquote(value):
+    """A snapshot value as text. The snapshot is YAML, and a value that starts
+    with a quote or holds a colon is written as a quoted scalar — `- text: ",
+    HERON-3"` — so the quotes are syntax, not part of what the page says."""
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return value
+        return decoded if isinstance(decoded, str) else value
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    return value
+
+
 def node(line):
     """One snapshot line as (role, name, value); ("", "", "") for anything else."""
     match = NODE.match(line.strip())
@@ -225,7 +282,7 @@ def node(line):
     return (
         match.group("role"),
         (match.group("name") or "").strip(),
-        (match.group("value") or "").strip(),
+        _unquote((match.group("value") or "").strip()),
     )
 
 
@@ -429,6 +486,101 @@ def turn_complete(snapshot):
     return False
 
 
+def _newest_turn(snapshot):
+    """The newest model turn's lines, controls included, or [] when there is none.
+
+    Unlike `reply_block` this does not stop at the rating cluster: an image's own
+    controls sit inside the turn, and the cluster carries a `Share image` of its
+    own on an image turn.
+    """
+    lines = (snapshot or "").splitlines()
+    start = _last_model_turn(lines)
+    if start < 0:
+        return []
+    turn = []
+    for line in lines[start + 1:]:
+        role, name, _ = node(line)
+        if turn_heading(role, name) or role in STOP_ROLES:
+            break
+        turn.append(line)
+    return turn
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip())
+
+
+def _image_tiles(lines):
+    """Generated images drawn in these lines: an unnamed button wrapping an img.
+
+    An icon is an img too, but it carries its glyph name as a value (`img: download`),
+    so an img with no value is a picture. Its name varies: unnamed on one live
+    page, `", AI generated"` on another (2026-09-24), so the name is not read.
+    """
+    tiles = 0
+    for index, line in enumerate(lines[:-1]):
+        role, name, _ = node(line)
+        if role != "button" or name:
+            continue
+        inner = lines[index + 1]
+        inner_role, _, inner_value = node(inner)
+        if inner_role == "img" and not inner_value:
+            if _indent(inner) > _indent(line):
+                tiles += 1
+    return tiles
+
+
+def image_downloads(snapshot):
+    """How many images in the newest model turn have their download control."""
+    count = 0
+    for line in _newest_turn(snapshot):
+        role, name, _ = node(line)
+        if role == "button" and name == IMAGE_DOWNLOAD_NAME:
+            count += 1
+    return count
+
+
+def image_readiness(snapshot):
+    """Whether the newest model turn's images can all be downloaded.
+
+    `True` every image drawn in the turn has its download control. `False` the
+    turn shows an image, or an image's controls, and at least one image has no
+    download control yet. **`None` the turn shows no image evidence at all** —
+    as far as the page says it is a text turn, and text-turn completion rules
+    apply. None never makes a turn ready on its own: an image-only turn has no
+    text, so without `True` it has nothing to report.
+
+    Nothing here trusts the rating cluster. Whether it can appear before an
+    image finishes rendering cannot be read off a finished page, so the safe
+    reading is that it can, and the per-image control is the evidence instead.
+    """
+    turn = _newest_turn(snapshot)
+    if not turn:
+        return None
+    tiles = _image_tiles(turn)
+    downloads = 0
+    controls = False
+    for line in turn:
+        role, name, _ = node(line)
+        if role != "button":
+            continue
+        if name == IMAGE_DOWNLOAD_NAME:
+            downloads += 1
+        if name in IMAGE_CONTROL_NAMES:
+            controls = True
+    if not (tiles or downloads or controls):
+        return None
+    return bool(downloads) and downloads >= tiles
+
+
+def image_download_selector(index):
+    """A CSS selector for the download control of image `index` (1-based) in the newest turn."""
+    return (
+        f"{NEWEST_EXCHANGE_SELECTOR} {IMAGE_GROUP_SELECTOR} > "
+        f":nth-child({index} of :has({IMAGE_DOWNLOAD_SELECTOR})) {IMAGE_DOWNLOAD_SELECTOR}"
+    )
+
+
 def conversation_id(url):
     """The id in `https://gemini.google.com/app/<id>`, or "" for a fresh app."""
     marker = "/app/"
@@ -459,8 +611,53 @@ def trouble(text):
     return ""
 
 
-def _tail_after(history, sent):
-    """What the rendered conversation says after the message just sent."""
+def rendered_text(output):
+    """a8s-browser's `text` output as the text the page shows.
+
+    The verb evaluates `innerText` through playwright-cli, which reports a
+    string result as a JSON string literal, and only the surrounding quotes are
+    taken off on the way here. So a line break arrives as a backslash and an
+    `n`, and without decoding a fallback reply is sent with the escapes in it.
+    Text that already has real line breaks, or no backslash at all, is taken
+    as it is.
+    """
+    if not output or "\n" in output or "\\" not in output:
+        return output or ""
+    try:
+        decoded = json.loads(f'"{output}"')
+    except ValueError:
+        return output
+    return decoded if isinstance(decoded, str) else output
+
+
+def furniture(snapshot):
+    """Labels of the page's own controls, which rendered text picks up as lines.
+
+    Button names, icon glyph names, the mode picker's model name, the turn
+    headings: none of them is something Gemini said. A reply built from the
+    rendered text drops any line that is exactly one of these.
+    """
+    labels = {MODEL_TURN_HEADING, USER_TURN_HEADING, *TRAILING_NOISE}
+    model = current_model(snapshot)
+    if model:
+        labels.add(model)
+    for line in (snapshot or "").splitlines():
+        role, name, value = node(line)
+        if role in TEXT_ROLES or role == "heading":
+            continue
+        for label in (name, value):
+            if label:
+                labels.add(label)
+    return {label.strip().lower() for label in labels if label.strip()}
+
+
+def _tail_after(history, sent, snapshot=""):
+    """What the rendered conversation says after the message just sent.
+
+    Only lines that are not page furniture count. A tail made of nothing but
+    headings and control labels is not an answer, and it is returned as "".
+    """
+    history = rendered_text(history)
     if not history or not sent:
         return ""
     needle = sent.strip()
@@ -474,21 +671,25 @@ def _tail_after(history, sent):
     tail = history[index + len(needle):]
     for noise in TRAILING_NOISE:
         tail = tail.split(noise, 1)[0]
-    return tail.strip()
+    skip = furniture(snapshot)
+    kept = [line for line in tail.splitlines() if line.strip().lower() not in skip]
+    return "\n".join(kept).strip()
 
 
 def extract_reply(snapshot, history, sent):
     """The newest reply: the snapshot's own turn structure, else the text.
 
     The structure comes first because it is unambiguous — the last `Gemini
-    said` heading is the turn that just ran. The rendered text is the fallback
-    for when those headings change, and it is anchored on the message that was
-    just sent, which is text this driver already knows.
+    said` heading is the turn that just ran. When that heading is on the page,
+    its turn is the whole answer, **including when it holds no text**: an image
+    turn has none, and reading the rendered text instead returns the page's
+    furniture as though Gemini had written it. The rendered text is the fallback
+    only for a page whose headings no longer match, and it is anchored on the
+    message that was just sent, which is text this driver already knows.
     """
-    block = reply_block(snapshot)
-    if block:
-        return block
-    return _tail_after(history, sent)
+    if _last_model_turn((snapshot or "").splitlines()) >= 0:
+        return reply_block(snapshot)
+    return _tail_after(history, sent, snapshot)
 
 
 def _run(browser, script, doing):
@@ -567,9 +768,12 @@ def open_conversation(browser, url):
     ).strip()
     _require_signed_in(browser, landed)
     if wanted and conversation_id(landed) != wanted:
+        # Where the browser landed is not evidence of why. A page lost to a
+        # browser restart lands on about:blank, and nothing here has seen what
+        # Gemini shows for a conversation that was really deleted.
         raise GeminiError(
-            f"the stored conversation {wanted} did not open — the browser landed on "
-            f"{landed}, so it was probably deleted in Gemini"
+            f"the stored conversation {wanted} could not be opened — the browser "
+            f"landed on {landed}"
         )
     return landed
 
@@ -596,20 +800,21 @@ BLANK_PAGE = "about:blank"
 def _no_prompt(browser, snapshot):
     """Why the composer is missing, with the likely cause named.
 
-    A blank page after a navigation that reported the app's own URL means the
-    page did not survive between two commands, and the way that happens is
-    a8s-browser cycling Chrome: it restarts a browser whose `visibilityState`
-    is "hidden", which a window behind other windows reports on macOS. Every
-    command then gets a fresh `about:blank`, and no driver can work across
-    calls. Saying so beats another sentence about selectors.
+    A blank page straight after a navigation that reported the app's own URL
+    means the page did not survive to the next command. With a8s-browser 0.3.1
+    or later, a covered or minimised window keeps its page, so that leaves two
+    causes: Chrome was restarted with no window to return to — a8s-browser names
+    the URL it lost in its own error when that happens — or somebody closed the
+    seat's window by hand.
     """
     seat = browser.seat or "<seat>"
     if not snapshot.strip() or BLANK_PAGE in snapshot:
         return (
             f"the seat landed on {BLANK_PAGE} straight after opening Gemini, so the page "
-            "is not surviving between commands. a8s-browser restarts a Chrome whose "
-            "window reports itself hidden, which is what an occluded or minimised "
-            f"window does. Bring seat {seat!r}'s Chrome window to the front and try again."
+            "did not survive to the next command. Either a8s-browser restarted Chrome "
+            "and could not return to the page (its own error names the URL it lost), "
+            f"or seat {seat!r}'s Chrome window was closed by hand. "
+            f"`a8s-browser -s {seat} open` brings the seat back."
         )
     return (
         f"no textbox in the page snapshot after {PROMPT_WAIT_SECONDS:.0f}s — Gemini's "
@@ -683,11 +888,13 @@ def read(browser, sent=""):
     """One look at the page: the newest reply, and whether it is finished."""
     transcript = _run(browser, poll_script(), "reading the conversation")
     snapshot = _snapshot_of(transcript, browser)
-    history = _first_output(transcript, "text")
+    history = rendered_text(_first_output(transcript, "text"))
     return Reading(
         extract_reply(snapshot, history, sent),
         turn_complete(snapshot),
         turn_counts(snapshot),
+        image_readiness(snapshot),
+        image_downloads(snapshot),
     )
 
 
@@ -712,25 +919,42 @@ def await_reply(browser, sent, baseline="", baseline_counts=None, now=None, slee
     the text has not moved for SETTLE_SECONDS. What counts as *this* turn's
     reply is `is_new`: the page's turn count moved, or, failing that, the text
     is no longer the `baseline` that was on screen before the message went in.
+
+    An image turn adds one condition and removes one shortcut. It is finished
+    only when `image_readiness` says every image has its download control — the
+    rating cluster is not trusted to wait for the pixels — and a turn with an
+    image still pending never settles, because a pending image is a static page
+    and a static page proves only that nothing moved. A text turn, where the
+    page shows no image evidence, is judged exactly as before.
     """
     now, sleep = now or _now, sleep or _sleep
     started = now()
     last = ""
+    last_seen = None
+    images = None
+    ready = 0
     counts = baseline_counts
     stable_since = None
     while True:
         reading = read(browser, sent)
         counts = reading.counts or counts
-        text = reading.text if is_new(reading, baseline, baseline_counts) else ""
-        if text and text == last:
+        fresh = is_new(reading, baseline, baseline_counts)
+        text = reading.text if fresh else ""
+        images = reading.images if fresh else None
+        ready = reading.image_count if images is not None else 0
+        has_answer = bool(text) or images is True
+        seen = (text, ready)
+        if has_answer and seen == last_seen:
             if stable_since is None:
                 stable_since = now()
         else:
             stable_since = None
-            last = text
-        if text and reading.complete:
-            return Turn(text, True, now() - started, counts=counts)
-        if text and stable_since is not None and now() - stable_since >= SETTLE_SECONDS:
+            last_seen = seen
+        last = text
+        if has_answer and images is not False and reading.complete:
+            return Turn(text, True, now() - started, counts=counts, images=ready)
+        settled = stable_since is not None and now() - stable_since >= SETTLE_SECONDS
+        if has_answer and images is not False and settled:
             return Turn(
                 text,
                 True,
@@ -738,10 +962,16 @@ def await_reply(browser, sent, baseline="", baseline_counts=None, now=None, slee
                 "the page never marked this turn finished; it is being reported because "
                 "the text stopped changing.",
                 counts=counts,
+                images=ready,
             )
         elapsed = now() - started
         if elapsed >= TURN_TIMEOUT_SECONDS:
-            if last:
+            if images is False:
+                note = (
+                    f"cut short: Gemini was still making an image after {elapsed:.0f}s, "
+                    "so an image that was still being made is not attached."
+                )
+            elif last:
                 note = (
                     f"cut short: Gemini was still writing after {elapsed:.0f}s, "
                     "so this reply may be unfinished."
@@ -752,8 +982,61 @@ def await_reply(browser, sent, baseline="", baseline_counts=None, now=None, slee
                     "reached Gemini's prompt box, or the turn headings in gemini.py no "
                     "longer match the page."
                 )
-            return Turn(last, False, elapsed, note, counts=counts)
+            return Turn(last, False, elapsed, note, counts=counts, images=ready)
         sleep(POLL_SECONDS)
+
+
+def download_images(browser, count):
+    """Fetch each generated image in the newest turn through a8s-browser's `download`.
+
+    Returns `(paths, failures)`: the files a8s-browser saved, in image order, and
+    one sentence per image that did not come back. A failure is named rather
+    than dropped, because an answer that silently arrives without the picture it
+    was asked for reads as Gemini's failure rather than this seat's.
+
+    The paths are a8s-browser's own artifacts. The caller copies them somewhere
+    it owns before handing them on.
+    """
+    paths = []
+    failures = []
+    digests = {}
+    for index in range(1, count + 1):
+        selector = image_download_selector(index)
+        script = f"download {shlex.quote(selector)} {DOWNLOAD_WAIT_SECONDS}"
+        which = f"image {index} of {count}"
+        try:
+            transcript = browser.run(script)
+        except BrowserError as exc:
+            failures.append(f"{which} could not be downloaded: {exc}")
+            continue
+        if not transcript.ok:
+            failures.append(f"{which} could not be downloaded: {transcript.error}")
+            continue
+        path = _first_output(transcript, "download").strip()
+        if not path or not os.path.isfile(path):
+            failures.append(
+                f"{which} could not be downloaded: a8s-browser named {path or 'no file'}, "
+                "which is not there"
+            )
+            continue
+        digest = _digest(path)
+        if digest in digests:
+            # The selector reached an image already fetched, which means it no
+            # longer tells this turn's images apart. Sending the same picture
+            # twice would hide that the other one is missing.
+            failures.append(
+                f"{which} could not be downloaded: the page handed back image "
+                f"{digests[digest]} again, so this seat cannot reach the others"
+            )
+            continue
+        digests[digest] = index
+        paths.append(path)
+    return paths, failures
+
+
+def _digest(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
 
 
 SUBMIT_STEP = "press Enter"
@@ -798,15 +1081,73 @@ def send_ready(snapshot):
     return None
 
 
+# A long name is shortened in the chip to its first and last few characters
+# around three dots: `a-rather-l...check-2026` for a 47-character name.
+CHIP_KEEP = 10
+
+
+def chip_label(name):
+    """What Gemini's attachment chip shows for a file.
+
+    The live chip (2026-09-24) is a clickable `generic` holding two more: the
+    extension in capitals (`TXT`) and the name without it (`probe-note`). A
+    long name is cut to its first and last `CHIP_KEEP` characters around
+    `...`. The full filename is not in the chip at all, so it is not what is
+    counted.
+    """
+    stem, _ = os.path.splitext(name)
+    stem = stem or name
+    if len(stem) > 2 * CHIP_KEEP + 3:
+        return f"{stem[:CHIP_KEEP]}...{stem[-CHIP_KEEP:]}"
+    return stem
+
+
 def _name_counts(snapshot, names):
-    """How many times each filename appears in the page, as a tuple.
+    """How many times each file's chip label appears in the page, as a tuple.
 
     A count rather than a presence test, because the conversation above the
     composer is part of the same snapshot: a correspondent who sent `report.pdf`
     an hour ago leaves that name on the page forever, and "is it there?" answers
     yes before the new upload has started.
     """
-    return tuple((snapshot or "").count(name) for name in names)
+    return tuple((snapshot or "").count(chip_label(name)) for name in names)
+
+
+def upload_script(path):
+    """The steps that put one file into the composer through Gemini's own menu."""
+    return "\n".join([
+        f"click {shlex.quote(UPLOAD_MENU_SELECTOR)}",
+        "wait 1",
+        f"click {shlex.quote(UPLOAD_MENU_ITEM)}",
+        "wait 1",
+        f"upload {shlex.quote(path)}",
+    ])
+
+
+def _upload_one(browser, path, names):
+    """Open the upload menu, pick `Upload files`, and answer the chooser.
+
+    A step that fails leaves the page in whatever state it reached, so the page
+    is read before anything else: a consent dialog is the operator's to answer
+    and is reported as that. Otherwise the open menu is dismissed, because an
+    open menu swallows the keystrokes that follow it.
+    """
+    name = os.path.basename(path)
+    try:
+        transcript = browser.run(upload_script(path))
+    except BrowserError as exc:
+        _dismiss_menu(browser)
+        raise GeminiError(f"putting {name} into the conversation: {exc}") from exc
+    if transcript.ok:
+        return
+    try:
+        snapshot = page_snapshot(browser)
+    except GeminiError:
+        snapshot = ""
+    if consent_pending(snapshot):
+        raise _consent_error(browser, names)
+    _dismiss_menu(browser)
+    raise GeminiError(f"putting {name} into the conversation: {transcript.error}")
 
 
 def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
@@ -822,7 +1163,7 @@ def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
     **The name has to be new.** The snapshot is the whole page, conversation
     included, so a name mentioned in an earlier turn would confirm an upload
     that has not begun. What is required is one *more* occurrence than a
-    baseline taken before the drop — a count, not a presence, so sending the
+    baseline taken before the upload — a count, not a presence, so sending the
     same filename twice still works.
 
     **The composer has to say it will send.** A filename renders while the
@@ -845,8 +1186,8 @@ def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
         raise _consent_error(browser, names)
     baseline = _name_counts(before, names)
 
-    script = "drop " + " ".join(shlex.quote(part) for part in [COMPOSER_SELECTOR, *paths])
-    _run(browser, script, f"putting {', '.join(names)} into the conversation")
+    for path in paths:
+        _upload_one(browser, path, names)
 
     deadline = now() + wait
     ready = None

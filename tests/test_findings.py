@@ -470,8 +470,11 @@ def test_a_page_that_does_not_survive_between_commands_says_so(
         runner=Cycled(tmp_path), send=outbox,
     )
     assert code == 1
-    assert "not surviving between commands" in outbox.last
-    assert "front" in outbox.last
+    assert "did not survive to the next command" in outbox.last
+    # A covered window keeps its page since a8s-browser 0.3.1, so the seat must
+    # not send anyone off to rearrange windows.
+    assert "front" not in outbox.last
+    assert "closed by hand" in outbox.last
 
 
 # --- second review: four more, all in what happens around a delivery ---------

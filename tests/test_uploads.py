@@ -1,4 +1,6 @@
 """A tell that carries files, from the message body into the conversation."""
+import shlex
+
 from test_handler import answer
 
 import attachments
@@ -31,7 +33,7 @@ def _asked(seat):
 
 
 class TestInbound:
-    def test_the_file_is_dropped_and_only_the_prose_is_typed(
+    def test_the_file_is_uploaded_and_only_the_prose_is_typed(
         self, tmp_path, seat, outbox, clock, state_home
     ):
         path = _attached(tmp_path, "report.pdf")
@@ -41,7 +43,7 @@ class TestInbound:
         assert code == 0
         assert seat.attached == ["report.pdf"]
         # The path is the thing that must not reach the page as text. It
-        # belongs on the drop line and nowhere else.
+        # belongs on the line that answers the file chooser and nowhere else.
         assert _asked(seat)[-1] == "summarise this"
         carrying = [
             line
@@ -49,17 +51,17 @@ class TestInbound:
             for line in script.splitlines()
             if path in line
         ]
-        assert carrying and all(line.startswith("drop ") for line in carrying)
+        assert carrying and all(line.startswith("upload ") for line in carrying)
         assert "report.pdf" in outbox.last
 
-    def test_the_drop_happens_before_the_keystroke_that_sends(
+    def test_the_upload_happens_before_the_keystroke_that_sends(
         self, tmp_path, seat, outbox, clock, state_home
     ):
         path = _attached(tmp_path, "chart.png")
         answer("gemini", "example-sender", _with_files("what is this", path), outbox, seat)
         joined = "\n".join(seat.scripts)
         # A file that lands after the send is a question about nothing.
-        assert joined.index("drop ") < joined.rindex(gemini.SUBMIT_STEP)
+        assert joined.index("upload ") < joined.rindex(gemini.SUBMIT_STEP)
 
     def test_several_files_go_in_together(
         self, tmp_path, seat, outbox, clock, state_home
@@ -116,6 +118,53 @@ class TestInbound:
         # The question still goes to Gemini; the sender is told what it went without.
         assert _asked(seat)[-1] == "look at this"
         assert "chart.png" in outbox.last
+
+
+class TestTheUploadMenu:
+    """Files go in through Gemini's own menu and chooser (live, 2026-09-24)."""
+
+    def test_each_file_gets_its_own_menu_and_chooser(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        one = _attached(tmp_path, "a.png")
+        two = _attached(tmp_path, "b.png")
+        answer("gemini", "example-sender", _with_files("compare", one, two), outbox, seat)
+        joined = "\n".join(seat.scripts)
+        # A chooser takes one file and closes, so the menu opens once per file.
+        assert joined.count(f"click {shlex.quote(gemini.UPLOAD_MENU_SELECTOR)}") == 2
+        assert joined.count(f"upload {one}") == 1
+        assert joined.count(f"upload {two}") == 1
+
+    def test_a_synthetic_drop_is_never_used(self, tmp_path, seat, outbox, clock, state_home):
+        path = _attached(tmp_path, "report.pdf")
+        answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
+        assert not any(
+            line.startswith("drop ") for script in seat.scripts for line in script.splitlines()
+        )
+
+    def test_a_chooser_that_never_opens_is_a_non_send_and_the_menu_is_closed(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        seat.clickable.discard(gemini.UPLOAD_MENU_SELECTOR)  # the page changed shape
+        path = _attached(tmp_path, "report.pdf")
+        code = answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
+        assert code == 1
+        assert _asked(seat) == []
+        assert "report.pdf" in outbox.last
+        # An open menu swallows the keystrokes that follow it.
+        assert "press Escape" in seat.scripts
+        assert not seat.menu_open
+
+    def test_the_chip_shows_the_name_without_its_extension(self):
+        assert gemini.chip_label("probe-note.txt") == "probe-note"
+        assert gemini.chip_label("archive.tar.gz") == "archive.tar"
+        assert gemini.chip_label("README") == "README"
+        # Read off the live chip for a 47-character name.
+        long_name = "a-rather-long-file-name-for-the-chip-check-2026.txt"
+        assert gemini.chip_label(long_name) == "a-rather-l...check-2026"
+        chip = "- generic [ref=e1] [cursor=pointer]:\n  - generic [ref=e2]: TXT\n" \
+            "  - generic [ref=e3]: probe-note\n"
+        assert gemini._name_counts(chip, ["probe-note.txt"]) == (1,)
 
 
 class TestConsent:
@@ -257,13 +306,13 @@ class TestConfirmationIsNotJustTheName:
     def test_the_text_is_typed_before_the_files_go_in(
         self, tmp_path, seat, outbox, clock, state_home
     ):
-        # The send control does not exist on an empty composer, so a drop that
-        # happened first would leave nothing to read.
+        # The send control does not exist on an empty composer, so an upload
+        # that happened first would leave nothing to read.
         path = _attached(tmp_path, "order.pdf")
         answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
         joined = "\n".join(seat.scripts)
-        assert joined.index("type <<") < joined.rindex("drop ")
-        assert joined.rindex("drop ") < joined.rindex(gemini.SUBMIT_STEP)
+        assert joined.index("type <<") < joined.rindex("upload ")
+        assert joined.rindex("upload ") < joined.rindex(gemini.SUBMIT_STEP)
 
     def test_send_ready_reads_the_control_three_ways(self):
         enabled = f'- button "{gemini.SEND_BUTTON_NAME}" [ref=e1] [cursor=pointer]'
