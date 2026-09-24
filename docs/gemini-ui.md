@@ -126,12 +126,27 @@ This driver detects it and says so; it does not press Agree. Accepting terms on
 an account is the same kind of one-time, by-hand step as signing the profile in,
 and it belongs to whoever owns the account.
 
-**The upload confirmation is a reading, not an observation.** `attach` waits for
-each file's own name to appear in the snapshot, which is the shape a filename
-chip would take. It could not be confirmed, because the consent dialog above
-blocks the upload and accepting it was not this driver's to do. If uploads start
-timing out with the files visibly in the composer, this is the row to fix: take
-a snapshot with a file attached and read what the chip is actually called.
+**The upload confirmation is built so it does not need the chip's shape.** The
+snapshot is the whole page, so two obvious readings are both wrong. "Is the
+filename there?" is answered yes by a conversation that mentioned the file an
+hour ago, before the new upload has even started. And a filename can render
+while the upload is still running and Send is still disabled, so a name that has
+just appeared is not yet a file Gemini holds.
+
+`attach` therefore requires two things, neither of which depends on knowing what
+an attachment chip looks like:
+
+1. **One more occurrence of each name than before the drop.** A baseline
+   snapshot is taken first, so history cannot confirm anything.
+2. **The page then reads the same twice running.** This is the settle the reply
+   wait already uses, for the same reason — the driver cannot watch a progress
+   indicator it has never been shown, but it can see a page that stopped moving.
+
+The chip's actual role and name are still unobserved, because the consent dialog
+blocks reaching them and accepting it is not this driver's to do. If uploads
+start timing out with files visibly in the composer, this is the row to fix:
+take a snapshot with a file attached and read what the chip is really called,
+then match the composer's own attachments instead of counting names.
 
 **Outbound artifacts are not implemented.** `img` is in neither `TEXT_ROLES` nor
 the roles reply extraction collects, so a generated image is invisible to

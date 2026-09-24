@@ -763,36 +763,72 @@ def _consent_error(browser, names):
     )
 
 
+def _name_counts(snapshot, names):
+    """How many times each filename appears in the page, as a tuple.
+
+    A count rather than a presence test, because the conversation above the
+    composer is part of the same snapshot: a correspondent who sent `report.pdf`
+    an hour ago leaves that name on the page forever, and "is it there?" answers
+    yes before the new upload has started.
+    """
+    return tuple((snapshot or "").count(name) for name in names)
+
+
 def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
     """Put files into the composer and wait until the page shows them.
 
     Nothing here submits anything, so every failure is a message that was not
-    sent — which is the one case this driver can safely let a8s retry.
+    sent — which is the one case this driver can safely let a8s retry. Giving up
+    is the same choice as failing: a question about a document nobody attached
+    reads as a model failure, and it costs a turn to discover.
 
-    The wait is on the file's own name appearing in the page. An upload is not
-    instant and the send button is disabled while it runs, so pressing Enter on
-    the way past would submit the prompt without the file it is about. Giving up
-    rather than sending anyway is the same choice: a question about a document
-    nobody attached reads as a model failure, and it costs a turn to discover.
+    Confirmation is two things, and neither is "the name is on the page".
+
+    **It has to be new.** The page carries the whole conversation, so a name
+    already in the history would confirm an upload that has not begun. What is
+    required is one *more* occurrence of each name than before the drop.
+
+    **It has to have stopped moving.** A filename can render while the upload is
+    still running and the send button is still disabled, so a count that has just
+    increased is not yet a file Gemini holds. The page must then read the same
+    twice in a row. That is the settle the reply wait already uses, for the same
+    reason: this driver cannot see a progress bar it has never been shown, and
+    a page that has stopped changing is the signal it can see.
+
+    The precise shape of an attachment chip is unverified — Gemini's first-upload
+    disclaimer blocks reaching it, and accepting that is not this driver's to do.
+    Both rules above are chosen to hold without knowing it. See
+    `docs/gemini-ui.md`.
     """
     now, sleep = now or _now, sleep or _sleep
     names = [os.path.basename(path) for path in paths]
+
+    before = _snapshot_of(_run(browser, "snap", "reading the composer"), browser)
+    if consent_pending(before):
+        raise _consent_error(browser, names)
+    baseline = _name_counts(before, names)
+
     script = "drop " + " ".join(shlex.quote(part) for part in [COMPOSER_SELECTOR, *paths])
     _run(browser, script, f"putting {', '.join(names)} into the conversation")
 
     deadline = now() + wait
-    snapshot = ""
+    settled = None
     while True:
         snapshot = _snapshot_of(_run(browser, "snap", "reading the composer"), browser)
         if consent_pending(snapshot):
             raise _consent_error(browser, names)
-        if all(name in snapshot for name in names):
-            return names
+        counts = _name_counts(snapshot, names)
+        if all(count > was for count, was in zip(counts, baseline, strict=True)):
+            if settled == snapshot:
+                return names
+            settled = snapshot
+        else:
+            settled = None
         if now() >= deadline:
             break
         sleep(POLL_SECONDS)
     raise GeminiError(
-        f"{', '.join(names)} did not appear in Gemini's composer within "
+        f"{', '.join(names)} did not settle in Gemini's composer within "
         f"{wait:.0f}s, so your message was not sent — a question about a file "
         "Gemini never received is worse than one you can send again."
     )

@@ -154,7 +154,11 @@ class FakeGeminiSeat:
         self.consent_open = False
         # Snaps an upload takes to show up, so the wait itself is exercised.
         self.upload_polls = 0
+        # Snaps the page keeps changing for AFTER the chip appears — a real
+        # upload renders its filename while it is still running.
+        self.upload_settle_polls = 0
         self._pending_uploads = []
+        self._progress = 0
 
     def run(self, script):
         self.scripts.append(script)
@@ -204,6 +208,11 @@ class FakeGeminiSeat:
             lines.append('  - button "Agree (Closes dialog box and gives disclaimer)" [ref=e5]')
         for name in self.attached:
             lines.append(f'  - button "Remove {name}" [ref=e6]')
+        if self.attached and self.upload_settle_polls > 0:
+            # The page is still moving: the chip is there, the upload is not done.
+            self.upload_settle_polls -= 1
+            self._progress += 1
+            lines.append(f'  - progressbar "Uploading" [ref=e7]: {self._progress}')
         for index, (role, text) in enumerate(self.history):
             ref = f"e{10 + index * 4}"
             last = index == len(self.history) - 1

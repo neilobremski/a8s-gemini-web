@@ -180,3 +180,67 @@ class TestTellArgv:
         )
         handler._tell("someone", "body")
         assert seen["argv"] == ["tell", "someone", "-"]
+
+
+class TestConfirmationIsNotJustTheName:
+    """Carlos R1 on PR3: the page carries the whole conversation."""
+
+    def test_a_name_already_in_the_history_does_not_confirm_a_new_upload(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        # A real earlier turn, so the conversation is resumed rather than
+        # created — a fresh conversation would clear the history and the
+        # scenario with it.
+        answer("gemini", "example-sender", "I will send you report.pdf shortly", outbox, seat)
+        assert any("report.pdf" in text for _, text in seat.history)
+
+        seat.upload_polls = 10_000  # this upload never lands
+        path = _attached(tmp_path, "report.pdf")
+
+        code = answer(
+            "gemini", "example-sender", _with_files("and this one?", path), outbox, seat
+        )
+
+        # Before the repair this returned 0, submitted the prompt without the
+        # file, and told the sender it was attached.
+        assert code == 1
+        assert "and this one?" not in _asked(seat)
+        assert "was not sent" in outbox.last
+        assert "attached to this turn" not in outbox.last
+
+    def test_a_chip_that_is_still_uploading_does_not_confirm(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        # The filename renders while the upload runs and Send is disabled.
+        seat.upload_settle_polls = 10_000
+        path = _attached(tmp_path, "slow.pdf")
+
+        code = answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
+
+        assert code == 1
+        assert "read it" not in _asked(seat)
+        assert "did not settle" in outbox.last
+
+    def test_an_upload_that_settles_is_confirmed(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        seat.upload_settle_polls = 2  # renders, moves, then stops
+        path = _attached(tmp_path, "fine.pdf")
+
+        code = answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
+
+        assert code == 0
+        assert _asked(seat)[-1] == "read it"
+        assert seat.attached == ["fine.pdf"]
+
+    def test_a_repeat_of_the_same_filename_is_still_confirmed(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        # Sending the same name twice must work: the test is one MORE
+        # occurrence, not a first one.
+        path = _attached(tmp_path, "again.pdf")
+        answer("gemini", "example-sender", _with_files("first", path), outbox, seat)
+        seat.attached = []  # Gemini clears the composer after a send
+        code = answer("gemini", "example-sender", _with_files("second", path), outbox, seat)
+        assert code == 0
+        assert _asked(seat)[-1] == "second"
