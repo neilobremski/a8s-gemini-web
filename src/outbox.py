@@ -6,6 +6,11 @@ re-running the turn to get it again would ask Gemini the same question twice.
 So a reply that cannot be handed over is written here, and the next run of this
 seat delivers it before it does anything else.
 
+A reply's attachments are *copied* here beside it, not referenced. The files a
+turn produces are browser-seat artifacts, and that directory is swept; a queue
+holding a path into it would deliver an answer that names a file nobody has,
+which is worse than not delivering at all.
+
 One file per reply, named so they sort oldest first, each written atomically.
 Two things keep a reply from going out twice:
 
@@ -24,6 +29,7 @@ nothing can still be sending it.
 """
 import json
 import os
+import shutil
 import tempfile
 import time
 import uuid
@@ -32,11 +38,42 @@ from store import Busy, FileLock
 
 SUFFIX = ".pending"
 CLAIM = ".claim-"
+# Bytes of a held reply's attachments, beside the reply that names them.
+FILES = ".files"
 
 # How long a claim is respected before it is taken to belong to a run that
 # died. `tell` takes milliseconds and only one flusher runs at a time, so
 # nothing healthy is ever reclaimed; without it a crash would strand a reply.
 RECLAIM_SECONDS = 300.0
+
+
+def _files_dir(path):
+    """Where one held reply's attachment copies live.
+
+    Derived from the reply's own name with any claim suffix stripped, because a
+    claim renames the reply and the files must still be found under the name
+    they were written with.
+    """
+    base = path.split(CLAIM, 1)[0]
+    if base.endswith(".json"):
+        base = base[: -len(".json")]
+    return base + FILES
+
+
+def _held_files(path, names):
+    """Paths of the attachment copies a held reply names, that are really there.
+
+    A name whose bytes have gone is dropped rather than raised on: the reply is
+    still worth delivering, and `tell` would refuse the whole thing over one
+    missing file.
+    """
+    directory = _files_dir(path)
+    found = []
+    for name in names or ():
+        full = os.path.join(directory, os.path.basename(str(name)))
+        if os.path.isfile(full):
+            found.append(full)
+    return found
 
 
 class Outbox:
@@ -54,26 +91,53 @@ class Outbox:
     def lock_path(self):
         return os.path.join(self.root, f".{self.seat}.flush.lock")
 
-    def keep(self, recipient, body):
-        """Hold a reply that could not be delivered. Returns its file."""
+    def keep(self, recipient, body, files=()):
+        """Hold a reply that could not be delivered. Returns its file.
+
+        Attachments are copied in before the reply is named, so a queue entry
+        that exists is one whose files exist too. A file that cannot be copied
+        is dropped from the reply and named in the body rather than failing the
+        hold: the answer is worth more than the attachment, and the turn that
+        produced it has already been spent.
+        """
         os.makedirs(self.path, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            "w", dir=self.path, prefix=f"{time.time():014.3f}-", suffix=".tmp", delete=False
+        )
+        final = handle.name[: -len(".tmp")] + ".json"
+        kept, lost = self._copy_files(_files_dir(final), files)
+        if lost:
+            body = body.rstrip() + "\n\n--\n" + "\n".join(lost)
         payload = {
             "to": recipient,
             "body": body,
             "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "files": kept,
         }
-        handle = tempfile.NamedTemporaryFile(
-            "w", dir=self.path, prefix=f"{time.time():014.3f}-", suffix=".tmp", delete=False
-        )
         with handle:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
-        final = handle.name[: -len(".tmp")] + ".json"
         os.replace(handle.name, final)
         return final
 
+    @staticmethod
+    def _copy_files(directory, files):
+        """Copy each attachment in beside the reply. Returns (names, notes)."""
+        kept = []
+        lost = []
+        for source in files or ():
+            name = os.path.basename(source)
+            try:
+                os.makedirs(directory, exist_ok=True)
+                shutil.copyfile(source, os.path.join(directory, name))
+            except OSError as exc:
+                lost.append(f"{name} could not be held for redelivery ({exc}).")
+                continue
+            kept.append(name)
+        return kept, lost
+
     def waiting(self):
-        """Each unclaimed reply as (path, recipient, body), oldest first.
+        """Each unclaimed reply as (path, recipient, body, files), oldest first.
 
         A file that is not readable JSON is skipped rather than raised on: it
         is one lost reply, and dying here would lose the turn that is running.
@@ -90,7 +154,12 @@ class Outbox:
             try:
                 with open(full) as handle:
                     payload = json.load(handle)
-                held.append((full, str(payload["to"]), str(payload["body"])))
+                held.append((
+                    full,
+                    str(payload["to"]),
+                    str(payload["body"]),
+                    _held_files(full, payload.get("files")),
+                ))
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         return held
@@ -98,8 +167,9 @@ class Outbox:
     def flush(self, send):
         """Try every held reply. Returns (delivered, still waiting).
 
-        `send` answers with a status, 0 for delivered, and is the network
-        sender rather than whatever the current call does with its own reply.
+        `send` takes `(recipient, body, files)` and answers with a status, 0
+        for delivered. It is the network sender rather than whatever the current
+        call does with its own reply.
         A reply that fails again is put back where it was, in order, and the
         next run tries it.
 
@@ -118,12 +188,12 @@ class Outbox:
 
     def _send_each(self, send):
         delivered = 0
-        for path, recipient, body in self.waiting():
+        for path, recipient, body, files in self.waiting():
             claimed = self._claim(path)
             if claimed is None:
                 continue
             try:
-                ok = int(send(recipient, body) or 0) == 0
+                ok = int(send(recipient, body, files) or 0) == 0
             except OSError:
                 self._restore(claimed, path)
                 break
@@ -194,6 +264,8 @@ class Outbox:
 
     @staticmethod
     def drop(path):
+        """Forget a delivered reply, and the attachment copies held with it."""
+        shutil.rmtree(_files_dir(path), ignore_errors=True)
         try:
             os.unlink(path)
         except OSError:

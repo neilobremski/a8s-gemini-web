@@ -146,6 +146,15 @@ class FakeGeminiSeat:
         self.clickable = {
             gemini.MODEL_BUTTON_SELECTORS[0],
         }
+        # Files in the composer, as chips the page would render.
+        self.attached = []
+        # A drop that raises Gemini's first-upload disclaimer instead of taking
+        # the file, which is what the live page does on a fresh profile.
+        self.consent_needed = False
+        self.consent_open = False
+        # Snaps an upload takes to show up, so the wait itself is exercised.
+        self.upload_polls = 0
+        self._pending_uploads = []
 
     def run(self, script):
         self.scripts.append(script)
@@ -177,10 +186,24 @@ class FakeGeminiSeat:
         return text[:shown], False
 
     def _snapshot(self):
+        if self._pending_uploads:
+            if self.upload_polls > 0:
+                self.upload_polls -= 1
+            else:
+                self.attached += self._pending_uploads
+                self._pending_uploads = []
         lines = [
             "- generic [ref=e1]:",
             f'  - button "{gemini.MODE_PICKER_PREFIX} {self.model}" [ref=e2]',
         ]
+        if self.consent_open:
+            lines.append(f'  - heading "{gemini.CONSENT_HEADING}" [level=1] [ref=e3]')
+            lines.append(
+                '  - button "Cancel (Closes dialog box and does not enable MMGen)" [ref=e4]'
+            )
+            lines.append('  - button "Agree (Closes dialog box and gives disclaimer)" [ref=e5]')
+        for name in self.attached:
+            lines.append(f'  - button "Remove {name}" [ref=e6]')
         for index, (role, text) in enumerate(self.history):
             ref = f"e{10 + index * 4}"
             last = index == len(self.history) - 1
@@ -203,6 +226,26 @@ class FakeGeminiSeat:
         lines.append(f'  - textbox "{self.label}" [ref=e90]')
         lines.append("  - paragraph: Gemini is AI and can make mistakes.")
         return "\n".join(lines) + "\n"
+
+    def _do_drop(self, args):
+        """Files dropped onto an element, as playwright-cli's `drop` does.
+
+        a8s-browser turns `drop <target> <path> ...` into one `--path` per file;
+        the driver builds the same line, so this takes the driver's form.
+        """
+        if not args or len(args) < 2:
+            raise StepFailed("usage: drop <target> <path> [<path> ...]")
+        if args[0] != gemini.COMPOSER_SELECTOR:
+            raise StepFailed(f"drop: nothing matching {args[0]!r}")
+        for path in args[1:]:
+            if not os.path.isfile(path):
+                raise StepFailed(f"drop: no such file: {path}")
+        if self.consent_needed:
+            # The page asks a person to accept its disclaimer; the file waits.
+            self.consent_open = True
+            return args[0]
+        self._pending_uploads += [os.path.basename(path) for path in args[1:]]
+        return args[0]
 
     def _do_go(self, args):
         if not self.signed_in:
@@ -279,12 +322,21 @@ class Outbox:
     def __init__(self):
         self.sent = []
 
-    def __call__(self, recipient, body):
-        self.sent.append((recipient, body))
+    def __call__(self, recipient, body, files=()):
+        self.sent.append((recipient, body, list(files or ())))
 
     @property
     def last(self):
         return self.sent[-1][1]
+
+    @property
+    def last_files(self):
+        """Paths attached to the newest reply, as `tell --attach` would get."""
+        return self.sent[-1][2]
+
+    @property
+    def last_names(self):
+        return [os.path.basename(path) for path in self.last_files]
 
 
 @pytest.fixture

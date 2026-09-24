@@ -181,11 +181,21 @@ def test_a_failure_after_the_message_is_typed_does_not_ask_gemini_twice(
     assert [text for role, text in seat.history if role == "user"][-1] == "hello"
 
 
-def test_a_long_reply_is_cut_to_the_body_cap(seat, outbox, clock, state_home):
+def test_a_long_reply_travels_whole_as_a_file_instead_of_being_cut(
+    seat, outbox, clock, state_home
+):
     seat.reply = lambda prompt: "x" * 9000 if "hello" in prompt else "ready"
     answer("gemini", "example-sender", "hello", outbox, seat)
     assert len(outbox.last) <= handler.MAX_BODY
-    assert outbox.last.endswith("(cut at this seat's reply cap)")
+    assert outbox.last_names == [handler.LONG_REPLY_NAME]
+    # The whole answer, not the excerpt the body carries.
+    assert open(outbox.last_files[0]).read().strip() == "x" * 9000
+    assert "attached as gemini-reply.md" in outbox.last
+
+
+def test_a_reply_inside_the_cap_carries_no_attachment(seat, outbox, clock, state_home):
+    answer("gemini", "example-sender", "hello", outbox, seat)
+    assert outbox.last_files == []
 
 
 def test_geminis_own_trouble_wording_is_passed_on_as_a_note(seat, outbox, clock, state_home):

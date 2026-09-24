@@ -25,6 +25,7 @@ Unverified and best effort: naming a conversation after its correspondent, and
 selecting a model. Both are non-fatal by design — a turn that cannot rename or
 cannot switch models still delivers its reply.
 """
+import os
 import re
 import shlex
 import time
@@ -84,6 +85,23 @@ TEXT_ROLES = ("paragraph", "text", "listitem", "code", "blockquote", "cell", "li
 # introductory sentence and throws away everything the sender asked for. Only a
 # *turn* heading ends a turn, which is the pair below.
 STOP_ROLES = ("textbox", "contentinfo", "form", "navigation", "banner")
+
+# The composer, as a selector rather than an accessible name, because `drop`
+# addresses an element and the box is a Quill editor. `div[contenteditable=true]`
+# on its own matches two elements — Quill keeps a hidden clipboard node — and
+# Playwright refuses an ambiguous target, so the editor class is part of it.
+COMPOSER_SELECTOR = 'div.ql-editor[contenteditable="true"]'
+
+# Gemini raises a disclaimer the first time a profile attaches anything, and the
+# file does not land until a person accepts it. Accepting terms on somebody's
+# account is not this driver's to do — it is the same kind of one-time, by-hand
+# step as signing the profile in.
+CONSENT_HEADING = "Creating content from images and files"
+
+# How long an upload is given to show up in the composer before the send is
+# abandoned. Nothing is submitted in that window, so running out is a message
+# kept rather than a message sent without its files.
+UPLOAD_WAIT_SECONDS = 30.0
 
 # a8s-browser's heredoc marker for the message text. It is this driver's choice
 # rather than the page's: any word works, and `_block_marker` lengthens it if a
@@ -470,18 +488,34 @@ def _first_output(transcript, verb):
 
 
 def _snapshot_of(transcript, browser):
-    """The snapshot a `snap` step attached, read off disk."""
-    paths = [path for path in transcript.files if path.endswith(".txt")] or transcript.files
+    """The snapshot a `snap` step attached, read off disk.
+
+    A `snap` step reports the file it wrote, so the snapshot is named rather
+    than guessed at. Taking the first `.txt` out of the run's artifacts is what
+    this used to do, and it stops being right the moment a script also
+    downloads something: artifacts are attached in script order, so a
+    downloaded `.txt` attached before the snap would be read as the page. The
+    artifact list is still the fallback, because a step that *fails* has a
+    snapshot attached to it without a `snap` command to report one.
+
+    The newest is the one that counts — a script may look twice.
+    """
+    named = [path for path in transcript.outputs("snap") if path.strip()]
+    paths = named or transcript.files
     if not paths:
         raise GeminiError(
             f"a8s-browser attached no snapshot for seat {browser.seat!r}, so the page "
             "cannot be read"
         )
+    path = paths[-1]
     try:
-        with open(paths[0]) as handle:
+        # `errors="replace"` because the fallback can land on a binary artifact,
+        # and a UnicodeDecodeError here would escape as a crash rather than as
+        # a reply telling the sender what went wrong.
+        with open(path, encoding="utf-8", errors="replace") as handle:
             return handle.read()
     except OSError as exc:
-        raise GeminiError(f"the page snapshot at {paths[0]} could not be read: {exc}") from exc
+        raise GeminiError(f"the page snapshot at {path} could not be read: {exc}") from exc
 
 
 def current_url(browser):
@@ -711,6 +745,57 @@ def _failed_step(transcript):
         if not step.get("ok"):
             return step
     return None
+
+
+def consent_pending(snapshot):
+    """Whether Gemini is holding a file behind its first-upload disclaimer."""
+    return CONSENT_HEADING.lower() in (snapshot or "").lower()
+
+
+def _consent_error(browser, names):
+    return GeminiError(
+        f"Gemini is asking this profile to accept its disclaimer about uploaded files "
+        f"before it will take one, so {', '.join(names)} was not sent and neither was "
+        f"your message. Someone has to accept it by hand, once: open the seat "
+        f"(`a8s-browser -s {browser.seat} open`), attach any file to a chat, and press "
+        f"Agree in the dialog that appears. This driver does not accept terms on an "
+        f"account it drives."
+    )
+
+
+def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
+    """Put files into the composer and wait until the page shows them.
+
+    Nothing here submits anything, so every failure is a message that was not
+    sent — which is the one case this driver can safely let a8s retry.
+
+    The wait is on the file's own name appearing in the page. An upload is not
+    instant and the send button is disabled while it runs, so pressing Enter on
+    the way past would submit the prompt without the file it is about. Giving up
+    rather than sending anyway is the same choice: a question about a document
+    nobody attached reads as a model failure, and it costs a turn to discover.
+    """
+    now, sleep = now or _now, sleep or _sleep
+    names = [os.path.basename(path) for path in paths]
+    script = "drop " + " ".join(shlex.quote(part) for part in [COMPOSER_SELECTOR, *paths])
+    _run(browser, script, f"putting {', '.join(names)} into the conversation")
+
+    deadline = now() + wait
+    snapshot = ""
+    while True:
+        snapshot = _snapshot_of(_run(browser, "snap", "reading the composer"), browser)
+        if consent_pending(snapshot):
+            raise _consent_error(browser, names)
+        if all(name in snapshot for name in names):
+            return names
+        if now() >= deadline:
+            break
+        sleep(POLL_SECONDS)
+    raise GeminiError(
+        f"{', '.join(names)} did not appear in Gemini's composer within "
+        f"{wait:.0f}s, so your message was not sent — a question about a file "
+        "Gemini never received is worse than one you can send again."
+    )
 
 
 def send(browser, label, message):

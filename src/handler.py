@@ -23,9 +23,11 @@ it has already been spent and re-running it would ask Gemini the same question
 twice.
 """
 import os
+import shutil
 import subprocess
 import sys
 
+import attachments
 import browser
 import gemini
 import identity
@@ -34,6 +36,16 @@ from outbox import Outbox
 from store import SessionStore, StoreError
 
 MAX_BODY = 4000
+
+# A reply too long for the body is sent as a file instead of being cut. The cap
+# exists so one answer cannot flood a mailbox; an attachment does not sit in the
+# message text, so it is not what the cap is protecting against.
+LONG_REPLY_NAME = "gemini-reply.md"
+
+# Body room given back when the whole reply travels as a file. `_compose` caps
+# the body and its notes together, so an excerpt that fills the cap exactly
+# would push out the note saying where the rest of the answer went.
+LONG_REPLY_RESERVE = 600
 
 # How long a wake waits for another run of this seat to finish its turn. A turn
 # is bounded by gemini.TURN_TIMEOUT_SECONDS, so a longer wait here would spend
@@ -53,18 +65,24 @@ def allowed(sender, spec):
     return sender.lower() in names
 
 
-def _tell(recipient, body):
+def _tell(recipient, body, files=()):
     """Hand one reply to a8s. Returns tell's exit status: 0 is delivered.
 
     A `tell` that cannot be launched at all — not on the wake's PATH, not
     executable — is a delivery failure like any other. Letting OSError out
     would skip the retention below and spend the whole Gemini turn again on
     the retry.
+
+    Attachments use `--attach=PATH`, one flag per file. The separated form
+    swallows following arguments while they happen to name existing files,
+    which would eat the recipient off the end of the command.
     """
+    argv = ["tell"]
+    for path in files or ():
+        argv.append(f"--attach={path}")
+    argv += [recipient, "-"]
     try:
-        return subprocess.run(
-            ["tell", recipient, "-"], input=body, text=True, check=False
-        ).returncode
+        return subprocess.run(argv, input=body, text=True, check=False).returncode
     except OSError as exc:
         print(f"a8s-gemini-web: `tell` could not be run ({exc})", file=sys.stderr)
         return 127
@@ -84,7 +102,7 @@ def _compose(reply, notes):
     return _capped("\n\n".join(parts))
 
 
-def _status(send, recipient, body):
+def _status(send, recipient, body, files=()):
     """One delivery attempt as a status, however it went wrong.
 
     A sender that answers with nothing counts as delivered, which is what an
@@ -92,21 +110,23 @@ def _status(send, recipient, body):
     a failure, not as an exception for somebody else to handle.
     """
     try:
-        return int(send(recipient, body) or 0)
+        return int(send(recipient, body, files) or 0)
     except OSError as exc:
         print(f"a8s-gemini-web: delivery to {recipient} could not start ({exc})", file=sys.stderr)
         return 127
 
 
-def _deliver(send, outbox, recipient, body):
+def _deliver(send, outbox, recipient, body, files=()):
     """Send a reply, and keep it if that fails.
 
     A reply that cannot be handed over is held on disk and delivered by the
-    next run of this seat, without asking Gemini anything a second time.
+    next run of this seat, without asking Gemini anything a second time. Its
+    attachments are copied into the queue with it, because the artifacts they
+    point at do not outlive the seat's own housekeeping.
     """
-    if _status(send, recipient, body) == 0:
+    if _status(send, recipient, body, files) == 0:
         return True
-    path = outbox.keep(recipient, body)
+    path = outbox.keep(recipient, body, files)
     print(
         f"a8s-gemini-web: tell to {recipient} failed; the reply is held at {path} "
         "and the next run of this seat will try again",
@@ -141,7 +161,7 @@ def _reconcile(runner, before, notes, state, exc):
     raise exc from None
 
 
-def _round_trip(seat, sender, message, runner, store, model, notes, state):
+def _round_trip(seat, sender, message, runner, store, model, notes, state, paths=()):
     """One correspondent's conversation, resumed or created, and one turn in it.
 
     `state["typed"]` records the moment the message itself reaches Gemini,
@@ -178,6 +198,13 @@ def _round_trip(seat, sender, message, runner, store, model, notes, state):
         if gemini.rate_limited(opening.reply):
             return opening
         baseline, counts = opening.reply, opening.counts
+
+    if paths:
+        # Before the send, always. Nothing has been submitted yet, so a refusal
+        # here is a message a8s can safely hand back — see `handle`'s contract.
+        notes.append(
+            "attached to this turn: " + ", ".join(gemini.attach(runner, paths))
+        )
 
     try:
         gemini.send(runner, label, message)
@@ -224,7 +251,7 @@ def handle(
         return 0
 
     # Held replies go out before this turn runs, and never through `send`.
-    outbox.flush(lambda to, body: _status(deliver, to, body))
+    outbox.flush(lambda to, body, files: _status(deliver, to, body, files))
 
     profile = browser_seat or os.environ.get("A8S_GEMINI_BROWSER_SEAT", "")
     if not profile:
@@ -257,12 +284,59 @@ def handle(
         return 1
 
 
+def _work_dir(seat, root):
+    """A fresh scratch dir for files this turn has to build.
+
+    Rebuilt per turn rather than accumulated: everything in it is either
+    already in the conversation or already copied into the outbox by the time
+    the turn ends, and one stale reply file read as this turn's is a wrong
+    answer sent confidently.
+    """
+    path = os.path.join(root, f".{seat}.work")
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _as_body_and_files(reply, notes, work_dir):
+    """The reply as a body plus attachments, sending a long one as a file.
+
+    Cutting a long answer throws away the part the sender most likely wanted —
+    the end of the program, the rest of the list. The cap keeps one answer from
+    flooding a mailbox, and a file does not sit in the message text, so sending
+    the whole thing as one costs the cap nothing.
+    """
+    if len(reply) <= MAX_BODY:
+        return reply, []
+    path = os.path.join(work_dir, LONG_REPLY_NAME)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(reply if reply.endswith("\n") else reply + "\n")
+    except OSError as exc:
+        notes.append(
+            "this reply is too long for a message and could not be written to a "
+            f"file ({exc}), so it is cut."
+        )
+        return reply, []
+    notes.append(
+        f"Gemini's answer is {len(reply)} characters, past this seat's {MAX_BODY}-character "
+        f"reply cap, so the whole of it is attached as {LONG_REPLY_NAME} rather than cut."
+    )
+    return reply[: MAX_BODY - LONG_REPLY_RESERVE].rstrip(), [path]
+
+
 def _turn(seat, sender, message, runner, store, model, send, outbox):
     notes = []
     state = {}
+    work_dir = _work_dir(seat, store.root)
+    incoming = attachments.read(message, work_dir)
+    notes.extend(incoming.notes)
 
     try:
-        turn = _round_trip(seat, sender, message, runner, store, model, notes, state)
+        turn = _round_trip(
+            seat, sender, incoming.prose, runner, store, model, notes, state,
+            paths=incoming.paths,
+        )
     except (gemini.GeminiError, browser.BrowserError) as exc:
         notes.insert(0, store.warning)
         if state.get("uncertain"):
@@ -290,5 +364,6 @@ def _turn(seat, sender, message, runner, store, model, send, outbox):
     if hit:
         notes.append(f"Gemini's own trouble wording is in this reply ({hit!r}).")
     reply = turn.reply.strip() or f"{seat}: nothing came back from Gemini for this message."
-    _deliver(send, outbox, sender, _compose(reply, notes))
+    body, files = _as_body_and_files(reply, notes, work_dir)
+    _deliver(send, outbox, sender, _compose(body, notes), files)
     return 0
