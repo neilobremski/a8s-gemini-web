@@ -93,8 +93,11 @@ TEXT_ROLES = (*BLOCK_ROLES, *INLINE_ROLES)
 # item, it is how the wrapper holding a code block is told from an inline span.
 CODE_BLOCK_BUTTON = "Copy code"
 # A table row is one line of the reply, its cells joined by this. The header
-# row is a row like any other.
+# row is a row like any other. An empty cell is an empty field between two
+# separators, and a cell holding several lines keeps them in its one field.
+CELL_ROLES = ("cell", "columnheader", "rowheader")
 CELL_SEPARATOR = " | "
+CELL_LINE_SEPARATOR = " / "
 # Punctuation that closes onto the run before it and opens onto the run after
 # it. Only used when the page's rendered text cannot settle the spacing.
 CLOSES_ONTO = ".,;:!?)]}%\u2019\u201d\u2026"
@@ -543,28 +546,43 @@ def _joint(left, right, flat_history):
     return " "
 
 
-def _code_block(pieces, history):
-    """A code block's text, newlines and indentation included.
-
-    The snapshot collapses a code block's whitespace, so its pieces say only
-    which characters it holds. The rendered text keeps the block as written, and
-    the last place those characters appear in order, whatever whitespace lies
-    between them, is the newest turn's block. Without the rendered text the
-    pieces are the best there is, one per line.
-    """
-    chars = "".join("".join(pieces).split())
-    if not chars:
+def _reply_region(history):
+    """The rendered text after the last `Gemini said`: the newest reply, and not
+    the prompt above it. "" when the rendered text has no such heading."""
+    index = (history or "").rfind(MODEL_TURN_HEADING)
+    if index < 0:
         return ""
-    if history:
-        matches = list(re.finditer(r"\s*".join(map(re.escape, chars)), history))
-        if matches:
-            found = matches[-1]
-            start = found.start()
-            line_start = history.rfind("\n", 0, start) + 1
-            if not history[line_start:start].strip(" \t"):
-                start = line_start
-            return history[start:found.end()]
-    return "\n".join(piece for piece in pieces if piece)
+    return history[index + len(MODEL_TURN_HEADING):]
+
+
+def _code_block(pieces, region, cursor):
+    """A code block's text, newlines and indentation included, and where the
+    search for the next block starts.
+
+    The snapshot collapses a code block's whitespace: a run of it inside one
+    piece becomes one space, and the pieces themselves are trimmed. So the
+    rendered block must agree with the snapshot token for token, whitespace
+    wherever the snapshot has a space and none where it has none, with only the
+    whitespace between pieces left open. `print("a b")` never matches
+    `print("ab")`.
+
+    The block is looked for in the newest reply's rendered text only, on lines
+    of its own, and from where the previous block was found: blocks are matched
+    in order and none is used twice, so two blocks with the same characters
+    each keep their own indentation. When no rendered block agrees, the
+    snapshot's own text is returned, one piece per line — never another
+    block's, and never the prompt's.
+    """
+    patterns = [r"\s+".join(map(re.escape, piece.split())) for piece in pieces if piece.split()]
+    if not patterns:
+        return "", cursor
+    found = None
+    if region:
+        body = r"\s*".join(patterns)
+        found = re.compile(rf"(?m)^([ \t]*{body})[ \t]*$").search(region, cursor)
+    if found:
+        return found.group(1), found.end()
+    return "\n".join(piece.strip() for piece in pieces if piece.strip()), cursor
 
 
 def reply_block(snapshot, history=""):
@@ -579,9 +597,13 @@ def reply_block(snapshot, history=""):
     lines. Without it the reply is still one line per block.
     """
     nodes = _turn_nodes(snapshot)
-    flat_history = " ".join((history or "").split())
+    region = _reply_region(history)
+    # Spacing is read from the newest reply when it can be found, and from the
+    # whole rendered text otherwise; a code block only ever from the reply.
+    flat_history = " ".join((region or history or "").split())
     finished = []
     runs = []
+    cursor = 0
 
     def end_line():
         text = ""
@@ -594,6 +616,7 @@ def reply_block(snapshot, history=""):
             finished.append(text)
 
     def walk(index, stop, inline):
+        nonlocal cursor
         while index < stop:
             _, role, name, value = nodes[index]
             end = _subtree_end(nodes, index)
@@ -611,7 +634,7 @@ def reply_block(snapshot, history=""):
             elif role == "code" and not inline:
                 end_line()
                 pieces = [value] + [child[3] or child[2] for child in nodes[index + 1:end]]
-                block = _code_block(pieces, history)
+                block, cursor = _code_block(pieces, region, cursor)
                 if block:
                     finished.append(block)
             elif role == "link":
@@ -620,15 +643,25 @@ def reply_block(snapshot, history=""):
                 runs.append(value or name)
                 walk(index + 1, end, True)
             elif role == "row":
-                # One line per row, cells side by side, as the page renders it.
+                # One line per row, one field per cell, as the page renders it.
+                # An empty cell is an empty field, so every column stays where
+                # its header is.
                 end_line()
-                first = len(finished)
-                walk(index + 1, end, False)
-                end_line()
-                cells = finished[first:]
-                del finished[first:]
-                if cells:
-                    finished.append(CELL_SEPARATOR.join(cells))
+                fields = []
+                child = index + 1
+                while child < end:
+                    child_end = _subtree_end(nodes, child)
+                    first = len(finished)
+                    walk(child, child_end, False)
+                    end_line()
+                    lines = "\n".join(finished[first:]).splitlines()
+                    del finished[first:]
+                    field = CELL_LINE_SEPARATOR.join(line.strip() for line in lines if line.strip())
+                    if field or nodes[child][1] in CELL_ROLES:
+                        fields.append(field)
+                    child = child_end
+                if fields:
+                    finished.append(CELL_SEPARATOR.join(fields))
             elif role in ("button", "img", ""):
                 pass
             elif inline and not _holds_blocks(nodes, index + 1, end):

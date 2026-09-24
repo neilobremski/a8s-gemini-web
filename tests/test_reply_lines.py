@@ -303,6 +303,87 @@ def test_a_code_block_whose_first_line_is_indented_keeps_that_indentation():
     assert gemini.reply_block(page, history) == "    indented = True\nflush = False"
 
 
+def test_two_code_blocks_with_the_same_characters_each_keep_their_own_indentation():
+    """The first block runs `log()` whatever `ready` is; the second only when it is
+    true. Handing both the second block's indentation changes what the code does."""
+    flat = "if ready: emit() log()"
+    page = turn(
+        "- paragraph: First:", f"- code: {flat}", "- paragraph: Second:", f"- code: {flat}"
+    )
+    first = "if ready:\n    emit()\nlog()"
+    second = "if ready:\n    emit()\n    log()"
+    history = f"Gemini said\nFirst:\nPython\n{first}\nSecond:\nPython\n{second}\n"
+    assert gemini.reply_block(page, history) == f"First:\n{first}\nSecond:\n{second}"
+
+
+def test_a_space_inside_a_code_block_is_never_matched_away():
+    page = turn('- code: print("a b")', "- paragraph: Then:", '- code: print("ab")')
+    history = 'Gemini said\nprint("a b")\nThen:\nprint("ab")'
+    assert gemini.reply_block(page, history) == 'print("a b")\nThen:\nprint("ab")'
+
+
+def test_a_rendered_block_that_disagrees_on_a_space_is_not_used():
+    """Only `print("ab")` is on the page; the snapshot says `print("a b")`. The
+    correspondence is not established, so the snapshot's text stands."""
+    page = turn('- code: print("a b")')
+    assert gemini.reply_block(page, 'Gemini said\nprint("ab")') == 'print("a b")'
+
+
+def test_rendered_text_with_no_turn_heading_still_settles_the_spacing():
+    page = turn("- paragraph:", "  - text: Use", "  - code: len", "  - text: (items).")
+    assert gemini.reply_block(page, "Use len(items).") == "Use len(items)."
+
+
+def test_a_code_block_is_never_read_from_the_prompt():
+    """The rendered reply does not hold the block yet; the prompt above it does,
+    indented differently. The snapshot's own text is the answer, not the prompt's."""
+    page = turn("- code: def run(): work()")
+    history = "You said\ndef run():\n        work()\nGemini said\nOutput not rendered yet"
+    assert gemini.reply_block(page, history) == "def run(): work()"
+
+
+def test_a_code_block_is_not_read_from_a_sentence_that_quotes_it():
+    page = turn(
+        "- paragraph:",
+        "  - text: Set",
+        "  - code: a = 1 b = 2",
+        "  - text: first.",
+        "- code: a = 1 b = 2",
+    )
+    history = "Gemini said\nSet a = 1 b = 2 first.\n\nPython\na = 1\nb = 2\n"
+    assert gemini.reply_block(page, history) == "Set a = 1 b = 2 first.\na = 1\nb = 2"
+
+
+def test_an_empty_table_cell_keeps_its_column():
+    page = turn(
+        "- table:",
+        "  - row:",
+        '    - columnheader "Name"',
+        '    - columnheader "Amount"',
+        '    - columnheader "Status"',
+        "  - row:",
+        '    - cell "Example"',
+        "    - cell",
+        '    - cell "Pending"',
+    )
+    history = "Gemini said\nName\tAmount\tStatus\nExample\t\tPending"
+    expected = "Name | Amount | Status\nExample |  | Pending"
+    assert gemini.reply_block(page, history) == expected
+    assert gemini.reply_block(page) == expected
+
+
+def test_a_cell_holding_two_paragraphs_is_still_one_column():
+    page = turn(
+        "- table:",
+        "  - row:",
+        "    - cell:",
+        "      - paragraph: Line one",
+        "      - paragraph: Line two",
+        '    - cell "Done"',
+    )
+    assert gemini.reply_block(page) == "Line one / Line two | Done"
+
+
 def test_a_poll_threads_the_rendered_text_through_to_the_reply(tmp_path):
     seat = ScriptedSeat([transcript(tmp_path, STRUCTURED, STRUCTURED_HISTORY)])
     reading = gemini.read(seat, "ask")
