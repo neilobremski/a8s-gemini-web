@@ -92,6 +92,13 @@ STOP_ROLES = ("textbox", "contentinfo", "form", "navigation", "banner")
 # Playwright refuses an ambiguous target, so the editor class is part of it.
 COMPOSER_SELECTOR = 'div.ql-editor[contenteditable="true"]'
 
+# The composer's own send control, and the only positive readiness evidence this
+# driver has. It does not exist while the prompt box is empty, and a snapshot
+# renders a disabled node with a trailing `[disabled]`. So "the composer will
+# send this now" is a thing the page can be asked, as long as the text is typed
+# before the files go in.
+SEND_BUTTON_NAME = "Send message"
+
 # Gemini raises a disclaimer the first time a profile attaches anything, and the
 # file does not land until a person accepts it. Accepting terms on somebody's
 # account is not this driver's to do — it is the same kind of one-time, by-hand
@@ -238,6 +245,18 @@ def _block_marker(lines):
     while marker in taken:
         marker += "X"
     return marker
+
+
+def compose_script(label, message):
+    """`send_script` without the keystroke that sends.
+
+    Used when files are going in. The text has to be in the box *first*: the
+    send control does not render at all while the prompt is empty, and that
+    control is the only evidence this driver has that an upload has finished.
+    """
+    script = send_script(label, message).splitlines()
+    assert script[-1] == SUBMIT_STEP
+    return "\n".join(script[:-1])
 
 
 def send_script(label, message):
@@ -763,6 +782,22 @@ def _consent_error(browser, names):
     )
 
 
+def send_ready(snapshot):
+    """Whether the composer will send what it is holding.
+
+    `True` ready, `False` not yet, and **`None` for no evidence either way** —
+    which is a different answer and is never treated as ready. The control is
+    absent from an empty composer, so `None` after the text is typed means the
+    page changed shape and this driver can no longer tell a finished upload from
+    a running one.
+    """
+    for line in (snapshot or "").splitlines():
+        role, name, _ = node(line)
+        if role == "button" and SEND_BUTTON_NAME.lower() in (name or "").lower():
+            return "[disabled]" not in line
+    return None
+
+
 def _name_counts(snapshot, names):
     """How many times each filename appears in the page, as a tuple.
 
@@ -775,30 +810,32 @@ def _name_counts(snapshot, names):
 
 
 def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
-    """Put files into the composer and wait until the page shows them.
+    """Put files into the composer and wait until it will send them.
 
     Nothing here submits anything, so every failure is a message that was not
-    sent — which is the one case this driver can safely let a8s retry. Giving up
-    is the same choice as failing: a question about a document nobody attached
-    reads as a model failure, and it costs a turn to discover.
+    sent — the one case this driver can safely let a8s retry. Giving up is the
+    same choice as failing: a question about a document nobody attached reads as
+    a model failure, and it costs a turn to discover.
 
-    Confirmation is two things, and neither is "the name is on the page".
+    Confirmation is two things, and "the filename is on the page" is neither.
 
-    **It has to be new.** The page carries the whole conversation, so a name
-    already in the history would confirm an upload that has not begun. What is
-    required is one *more* occurrence of each name than before the drop.
+    **The name has to be new.** The snapshot is the whole page, conversation
+    included, so a name mentioned in an earlier turn would confirm an upload
+    that has not begun. What is required is one *more* occurrence than a
+    baseline taken before the drop — a count, not a presence, so sending the
+    same filename twice still works.
 
-    **It has to have stopped moving.** A filename can render while the upload is
-    still running and the send button is still disabled, so a count that has just
-    increased is not yet a file Gemini holds. The page must then read the same
-    twice in a row. That is the settle the reply wait already uses, for the same
-    reason: this driver cannot see a progress bar it has never been shown, and
-    a page that has stopped changing is the signal it can see.
+    **The composer has to say it will send.** A filename renders while the
+    upload is still running, and a page that has stopped changing is not proof
+    of anything: a paused progress bar and a disabled button are textually
+    identical from one poll to the next. `Send message` is the page's own answer
+    to "will you send this now", and it is positive evidence rather than the
+    absence of a marker this driver has never been shown.
 
-    The precise shape of an attachment chip is unverified — Gemini's first-upload
-    disclaimer blocks reaching it, and accepting that is not this driver's to do.
-    Both rules above are chosen to hold without knowing it. See
-    `docs/gemini-ui.md`.
+    That control does not exist while the prompt is empty, which is why the text
+    is typed before the files go in. If it cannot be found at all, readiness is
+    *unknown*, and unknown is not ready: the message is kept and the reply says
+    which prerequisite went missing.
     """
     now, sleep = now or _now, sleep or _sleep
     names = [os.path.basename(path) for path in paths]
@@ -812,26 +849,62 @@ def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
     _run(browser, script, f"putting {', '.join(names)} into the conversation")
 
     deadline = now() + wait
-    settled = None
+    ready = None
     while True:
         snapshot = _snapshot_of(_run(browser, "snap", "reading the composer"), browser)
         if consent_pending(snapshot):
             raise _consent_error(browser, names)
         counts = _name_counts(snapshot, names)
-        if all(count > was for count, was in zip(counts, baseline, strict=True)):
-            if settled == snapshot:
-                return names
-            settled = snapshot
-        else:
-            settled = None
+        ready = send_ready(snapshot)
+        if ready and all(count > was for count, was in zip(counts, baseline, strict=True)):
+            return names
         if now() >= deadline:
             break
         sleep(POLL_SECONDS)
+
+    if ready is None:
+        raise GeminiError(
+            f"this seat cannot tell whether {', '.join(names)} finished uploading, so "
+            f"your message was not sent. Gemini's composer has no {SEND_BUTTON_NAME!r} "
+            "control in the page any more, and that control is what this driver reads "
+            "to know an upload is done. The page has changed shape — see "
+            "docs/gemini-ui.md, which names the row to fix."
+        )
     raise GeminiError(
-        f"{', '.join(names)} did not settle in Gemini's composer within "
+        f"{', '.join(names)} did not finish uploading in Gemini's composer within "
         f"{wait:.0f}s, so your message was not sent — a question about a file "
         "Gemini never received is worse than one you can send again."
     )
+
+
+def send_with_files(browser, label, message, paths):
+    """Type the message, put the files in, and only then send.
+
+    Three steps rather than one script, because the middle one has to look at
+    the page between the other two. The order is what makes the look worth
+    anything: the send control does not render on an empty composer, so the text
+    goes first, and then a disabled control means "still uploading" rather than
+    "nothing to send".
+
+    The keystroke is its own run, which keeps the uncertainty boundary exactly
+    where `send` puts it — everything before it is a definite non-send, and only
+    the keystroke itself is unknown.
+    """
+    _run(browser, compose_script(label, message), "typing the message into Gemini")
+    attached = attach(browser, paths)
+    try:
+        transcript = browser.run(SUBMIT_STEP)
+    except BrowserError as exc:
+        raise SendUncertain(
+            f"sending the message: {exc}. The seat never answered, so whether Gemini "
+            "received the message cannot be told from here."
+        ) from exc
+    if not transcript.ok:
+        raise SendUncertain(
+            f"sending the message: {transcript.error}. That failure is on the keystroke "
+            "that sends, so whether Gemini received the message cannot be told from here."
+        )
+    return attached
 
 
 def send(browser, label, message):

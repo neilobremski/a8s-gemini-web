@@ -208,23 +208,29 @@ class TestConfirmationIsNotJustTheName:
         assert "was not sent" in outbox.last
         assert "attached to this turn" not in outbox.last
 
-    def test_a_chip_that_is_still_uploading_does_not_confirm(
+    def test_a_chip_beside_a_disabled_send_never_confirms(
         self, tmp_path, seat, outbox, clock, state_home
     ):
-        # The filename renders while the upload runs and Send is disabled.
-        seat.upload_settle_polls = 10_000
+        """Carlos R1 on the repair: the pending page is STATIC.
+
+        The chip is there and the indicator never moves, so two identical
+        snapshots are the normal case for an upload that has not finished.
+        """
+        seat.upload_pending_polls = 10_000
         path = _attached(tmp_path, "slow.pdf")
 
         code = answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
 
         assert code == 1
         assert "read it" not in _asked(seat)
-        assert "did not settle" in outbox.last
+        assert "did not finish uploading" in outbox.last
 
-    def test_an_upload_that_settles_is_confirmed(
+    def test_an_upload_that_becomes_ready_is_confirmed(
         self, tmp_path, seat, outbox, clock, state_home
     ):
-        seat.upload_settle_polls = 2  # renders, moves, then stops
+        # Disabled for a while, then the control enables: the transition is the
+        # only thing that counts as done.
+        seat.upload_pending_polls = 3
         path = _attached(tmp_path, "fine.pdf")
 
         code = answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
@@ -232,6 +238,39 @@ class TestConfirmationIsNotJustTheName:
         assert code == 0
         assert _asked(seat)[-1] == "read it"
         assert seat.attached == ["fine.pdf"]
+
+    def test_no_send_control_is_unknown_and_unknown_is_not_ready(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        # The page changed shape. Absence of evidence must not read as ready.
+        seat.send_button = False
+        path = _attached(tmp_path, "report.pdf")
+
+        code = answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
+
+        assert code == 1
+        assert "read it" not in _asked(seat)
+        assert "cannot tell" in outbox.last
+        assert gemini.SEND_BUTTON_NAME in outbox.last
+        assert "docs/gemini-ui.md" in outbox.last
+
+    def test_the_text_is_typed_before_the_files_go_in(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        # The send control does not exist on an empty composer, so a drop that
+        # happened first would leave nothing to read.
+        path = _attached(tmp_path, "order.pdf")
+        answer("gemini", "example-sender", _with_files("read it", path), outbox, seat)
+        joined = "\n".join(seat.scripts)
+        assert joined.index("type <<") < joined.rindex("drop ")
+        assert joined.rindex("drop ") < joined.rindex(gemini.SUBMIT_STEP)
+
+    def test_send_ready_reads_the_control_three_ways(self):
+        enabled = f'- button "{gemini.SEND_BUTTON_NAME}" [ref=e1] [cursor=pointer]'
+        disabled = f'- button "{gemini.SEND_BUTTON_NAME}" [ref=e1] [disabled]'
+        assert gemini.send_ready(enabled) is True
+        assert gemini.send_ready(disabled) is False
+        assert gemini.send_ready('- textbox "Enter a prompt for Gemini" [ref=e1]') is None
 
     def test_a_repeat_of_the_same_filename_is_still_confirmed(
         self, tmp_path, seat, outbox, clock, state_home

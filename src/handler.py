@@ -199,15 +199,16 @@ def _round_trip(seat, sender, message, runner, store, model, notes, state, paths
             return opening
         baseline, counts = opening.reply, opening.counts
 
-    if paths:
-        # Before the send, always. Nothing has been submitted yet, so a refusal
-        # here is a message a8s can safely hand back — see `handle`'s contract.
-        notes.append(
-            "attached to this turn: " + ", ".join(gemini.attach(runner, paths))
-        )
-
     try:
-        gemini.send(runner, label, message)
+        if paths:
+            # Type, attach, then send — three steps, because the composer has to
+            # be asked whether it will send before the keystroke. Everything
+            # before that keystroke is a definite non-send, so a refusal here is
+            # a message a8s can safely hand back.
+            attached = gemini.send_with_files(runner, label, message, paths)
+            notes.append("attached to this turn: " + ", ".join(attached))
+        else:
+            gemini.send(runner, label, message)
     except gemini.SendUncertain as exc:
         _reconcile(runner, counts, notes, state, exc)
     else:

@@ -40,6 +40,7 @@ below, and put whatever it says now into the constant beside it.
 | `COMPOSER_SELECTOR` | `div.ql-editor[contenteditable="true"]` — the prompt box as an *element*, for `drop`. `div[contenteditable="true"]` alone matches two nodes (Quill keeps a hidden `.ql-clipboard`) and Playwright refuses an ambiguous target | observed 2026-09-23 |
 | `CONSENT_HEADING` | `Creating content from images and files` — the dialog Gemini raises the first time a profile attaches anything, with `Cancel` and `Agree`. Until a person presses Agree, no file lands | observed 2026-09-23 |
 | — (uploading) | `drop <COMPOSER_SELECTOR> <abs path> ...`, before the submitting keystroke | observed 2026-09-23 |
+| `SEND_BUTTON_NAME` | `Send message` — a button in the composer, with an `img: arrow_upward`. **It does not exist while the prompt box is empty**, and appears once there is text. A snapshot marks a disabled node with a trailing `[disabled]`, so this is the page's own answer to "will you send this now" | observed 2026-09-23 |
 | — (the upload menu) | `button "Upload & tools"`, with an `img: plus` inside it. **Not used.** It opens a menu, and this driver does not open menus | observed 2026-09-23 |
 
 The date is when someone looked. The interface changes without notice, so
@@ -126,27 +127,41 @@ This driver detects it and says so; it does not press Agree. Accepting terms on
 an account is the same kind of one-time, by-hand step as signing the profile in,
 and it belongs to whoever owns the account.
 
-**The upload confirmation is built so it does not need the chip's shape.** The
-snapshot is the whole page, so two obvious readings are both wrong. "Is the
-filename there?" is answered yes by a conversation that mentioned the file an
-hour ago, before the new upload has even started. And a filename can render
-while the upload is still running and Send is still disabled, so a name that has
-just appeared is not yet a file Gemini holds.
+**The upload confirmation asks the composer, it does not read the chip.** The
+snapshot is the whole page, so three readings are wrong and one is right.
 
-`attach` therefore requires two things, neither of which depends on knowing what
-an attachment chip looks like:
+*Wrong:* "is the filename there?" — answered yes by a conversation that mentioned
+the file an hour ago, before this upload started.
 
-1. **One more occurrence of each name than before the drop.** A baseline
-   snapshot is taken first, so history cannot confirm anything.
-2. **The page then reads the same twice running.** This is the settle the reply
-   wait already uses, for the same reason — the driver cannot watch a progress
-   indicator it has never been shown, but it can see a page that stopped moving.
+*Wrong:* "has the filename just appeared?" — a chip renders while the upload is
+still running.
 
-The chip's actual role and name are still unobserved, because the consent dialog
-blocks reaching them and accepting it is not this driver's to do. If uploads
-start timing out with files visibly in the composer, this is the row to fix:
-take a snapshot with a file attached and read what the chip is really called,
-then match the composer's own attachments instead of counting names.
+*Wrong:* "has the page stopped changing?" — a pending upload is **static**. A
+paused progress bar and a disabled button read identically from one poll to the
+next, so a settle proves only that nothing moved.
+
+*Right:* ask the control whose whole job is to answer it. `Send message` is
+disabled while the upload runs and enabled when it is done. That is positive
+evidence about the current composer rather than the absence of a marker nobody
+has shown this driver.
+
+So `attach` requires **one more occurrence of each name than a baseline taken
+before the drop** — which stops history confirming anything, while still letting
+the same filename be sent twice — **and** `send_ready(snapshot) is True`.
+
+`send_ready` has three answers, and the third is the point. `True` ready, `False`
+not yet, and **`None` for no evidence either way**, which is never treated as
+ready. If the control is gone from the page, this driver can no longer tell a
+finished upload from a running one, so the message is kept and the reply names
+the prerequisite instead of guessing.
+
+**This is why the text is typed before the files go in.** The send control does
+not render on an empty composer, so a drop that happened first would leave
+nothing to read.
+
+The attachment chip's own role and name are still unobserved — the consent
+dialog blocks reaching them and accepting it is not this driver's to do. Nothing
+above depends on them.
 
 **Outbound artifacts are not implemented.** `img` is in neither `TEXT_ROLES` nor
 the roles reply extraction collects, so a generated image is invisible to

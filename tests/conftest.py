@@ -154,11 +154,15 @@ class FakeGeminiSeat:
         self.consent_open = False
         # Snaps an upload takes to show up, so the wait itself is exercised.
         self.upload_polls = 0
-        # Snaps the page keeps changing for AFTER the chip appears — a real
-        # upload renders its filename while it is still running.
-        self.upload_settle_polls = 0
+        # Snaps the upload stays PENDING for after its chip appears — a real
+        # upload renders its filename while it is still running, and the send
+        # control stays disabled until it finishes. A static indicator is the
+        # point: nothing about the page needs to change while it is pending.
+        self.upload_pending_polls = 0
+        # A page that no longer carries the send control at all, so readiness
+        # cannot be established either way.
+        self.send_button = True
         self._pending_uploads = []
-        self._progress = 0
 
     def run(self, script):
         self.scripts.append(script)
@@ -206,13 +210,15 @@ class FakeGeminiSeat:
                 '  - button "Cancel (Closes dialog box and does not enable MMGen)" [ref=e4]'
             )
             lines.append('  - button "Agree (Closes dialog box and gives disclaimer)" [ref=e5]')
+        pending = False
         for name in self.attached:
             lines.append(f'  - button "Remove {name}" [ref=e6]')
-        if self.attached and self.upload_settle_polls > 0:
-            # The page is still moving: the chip is there, the upload is not done.
-            self.upload_settle_polls -= 1
-            self._progress += 1
-            lines.append(f'  - progressbar "Uploading" [ref=e7]: {self._progress}')
+        if self.attached and self.upload_pending_polls > 0:
+            # The chip is there and the upload is not done. Deliberately static:
+            # two identical snapshots must not read as a finished upload.
+            self.upload_pending_polls -= 1
+            pending = True
+            lines.append('  - progressbar "Uploading" [ref=e7]')
         for index, (role, text) in enumerate(self.history):
             ref = f"e{10 + index * 4}"
             last = index == len(self.history) - 1
@@ -233,6 +239,11 @@ class FakeGeminiSeat:
                     for n, label in enumerate(gemini.COMPLETION_BUTTONS)
                 ]
         lines.append(f'  - textbox "{self.label}" [ref=e90]')
+        if self.draft and self.send_button:
+            # The live control only exists once the prompt box has text, and a
+            # snapshot marks a disabled node with a trailing `[disabled]`.
+            flag = " [disabled]" if pending else ""
+            lines.append(f'  - button "{gemini.SEND_BUTTON_NAME}" [ref=e91]{flag}')
         lines.append("  - paragraph: Gemini is AI and can make mistakes.")
         return "\n".join(lines) + "\n"
 
