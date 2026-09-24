@@ -77,7 +77,28 @@ COMPLETION_BUTTONS = ("Good response", "Bad response", "Redo", "Show more option
 
 # Snapshot roles that carry reply text. Buttons, headings and the rest of the
 # page's furniture are not part of what Gemini said.
-TEXT_ROLES = ("paragraph", "text", "listitem", "code", "blockquote", "cell", "link")
+#
+# A block role starts a line of the reply and ends it. An inline role is a run
+# inside the current line: one sentence with inline code, a link or a citation
+# marker in it arrives as several sibling runs of one paragraph, and each run is
+# trimmed, so the space between two runs is not in the snapshot at all (observed
+# 2026-09-24). Bold and italic are not runs; the snapshot merges them into the
+# surrounding text. `strong`, `emphasis` and `subscript` are the roles a snapshot
+# gives other inline markup, and are a reading rather than an observation.
+BLOCK_ROLES = ("paragraph", "listitem", "blockquote", "cell", "columnheader", "rowheader")
+INLINE_ROLES = ("text", "code", "link", "superscript", "subscript", "strong", "emphasis")
+TEXT_ROLES = (*BLOCK_ROLES, *INLINE_ROLES)
+# A code block sits beside its own header, which carries the language's name and
+# this button; inline code never has one (observed 2026-09-24). Inside a list
+# item, it is how the wrapper holding a code block is told from an inline span.
+CODE_BLOCK_BUTTON = "Copy code"
+# Punctuation that closes onto the run before it and opens onto the run after
+# it. Only used when the page's rendered text cannot settle the spacing.
+CLOSES_ONTO = ".,;:!?)]}%\u2019\u201d\u2026"
+OPENS_ONTO = "([{\u2018\u201c"
+# How much of each run is looked for in the rendered text to settle the space
+# between two runs: long enough not to match somewhere else by chance.
+JOINT_CONTEXT = 24
 # Roles that end a turn. A button does not: a reply with a code block in it
 # carries a copy button of its own, and stopping there would cut the reply in
 # half. The prompt box is what actually sits below the last turn, which is also
@@ -284,9 +305,28 @@ def _unquote(value):
     return value
 
 
+def _unquote_key(line):
+    """`- 'role "name: x" [ref=e1]': value` as `- role "name: x" [ref=e1]: value`.
+
+    YAML single-quotes a whole key that holds `: `, as a citation's source chip
+    does (observed 2026-09-24), and the node inside is as readable as any other.
+    """
+    if not line.startswith("- '"):
+        return line
+    index = 3
+    while True:
+        end = line.find("'", index)
+        if end < 0:
+            return line
+        if line[end + 1:end + 2] == "'":
+            index = end + 2
+            continue
+        return "- " + line[3:end].replace("''", "'") + line[end + 1:]
+
+
 def node(line):
     """One snapshot line as (role, name, value); ("", "", "") for anything else."""
-    match = NODE.match(line.strip())
+    match = NODE.match(_unquote_key(line.strip()))
     if not match:
         return "", "", ""
     return (
@@ -445,37 +485,154 @@ def _last_model_turn(lines):
     return found
 
 
-def reply_block(snapshot):
-    """The newest model turn's text, taken from the snapshot's own structure.
-
-    Anchored on the last `Gemini said` heading and stopped at whatever ends the
-    turn, so no assumption is made about the markup inside a turn beyond which
-    roles carry text.
-    """
+def _turn_nodes(snapshot):
+    """The newest model turn as (indent, role, name, value), up to what ends it."""
     lines = snapshot.splitlines()
     start = _last_model_turn(lines)
     if start < 0:
-        return ""
-    collected = []
+        return []
+    nodes = []
     for line in lines[start + 1:]:
         role, name, value = node(line)
-        if turn_heading(role, name):
-            break
-        if role in STOP_ROLES:
+        if turn_heading(role, name) or role in STOP_ROLES:
             break
         if role == "button" and name in COMPLETION_BUTTONS:
             break
-        if role == "heading":
-            # A section heading inside the answer. It is part of what Gemini
-            # wrote, and dropping it would run two sections together.
-            text = name or value
-        elif role in TEXT_ROLES:
-            text = value or name
-        else:
-            continue
+        nodes.append((_indent(line), role, name, value))
+    return nodes
+
+
+def _subtree_end(nodes, index):
+    """The index just past `nodes[index]` and everything nested under it."""
+    indent = nodes[index][0]
+    end = index + 1
+    while end < len(nodes) and nodes[end][0] > indent:
+        end += 1
+    return end
+
+
+def _holds_blocks(nodes, start, stop):
+    """Whether these nodes hold a line of their own: a block, or a code block's header."""
+    for _, role, name, _ in nodes[start:stop]:
+        if role in BLOCK_ROLES or role in ("heading", "list", "table"):
+            return True
+        if role == "button" and name == CODE_BLOCK_BUTTON:
+            return True
+    return False
+
+
+def _joint(left, right, flat_history):
+    """What goes between two runs of one line: a space, or nothing.
+
+    The page's rendered text is asked first, because it has the space the
+    snapshot trimmed away: `len`(x) and `str`s are glued on the page. When it
+    cannot tell, the runs are spaced, except onto punctuation that closes or
+    opens onto its neighbour.
+    """
+    if flat_history:
+        tail, head = left[-JOINT_CONTEXT:], right[:JOINT_CONTEXT]
+        glued = tail + head in flat_history
+        spaced = f"{tail} {head}" in flat_history
+        if glued != spaced:
+            return "" if glued else " "
+    if right[0] in CLOSES_ONTO or left[-1] in OPENS_ONTO:
+        return ""
+    return " "
+
+
+def _code_block(pieces, history):
+    """A code block's text, newlines and indentation included.
+
+    The snapshot collapses a code block's whitespace, so its pieces say only
+    which characters it holds. The rendered text keeps the block as written, and
+    the last place those characters appear in order, whatever whitespace lies
+    between them, is the newest turn's block. Without the rendered text the
+    pieces are the best there is, one per line.
+    """
+    chars = "".join("".join(pieces).split())
+    if not chars:
+        return ""
+    if history:
+        matches = list(re.finditer(r"\s*".join(map(re.escape, chars)), history))
+        if matches:
+            found = matches[-1]
+            start = found.start()
+            line_start = history.rfind("\n", 0, start) + 1
+            if not history[line_start:start].strip(" \t"):
+                start = line_start
+            return history[start:found.end()]
+    return "\n".join(piece for piece in pieces if piece)
+
+
+def reply_block(snapshot, history=""):
+    """The newest model turn's text, taken from the snapshot's own structure.
+
+    Anchored on the last `Gemini said` heading and stopped at whatever ends the
+    turn. Inside it, a block (paragraph, list item, heading, table cell,
+    blockquote, code block) is a line of its own and an inline run joins the
+    line it sits in, so one sentence with a citation, a link or inline code in
+    it stays one sentence. `history` is the page's rendered text from the same
+    look; it settles the spacing between runs and gives a code block back its
+    lines. Without it the reply is still one line per block.
+    """
+    nodes = _turn_nodes(snapshot)
+    flat_history = " ".join((history or "").split())
+    finished = []
+    runs = []
+
+    def end_line():
+        text = ""
+        for run in runs:
+            run = run.strip()
+            if run:
+                text += (_joint(text, run, flat_history) if text else "") + run
+        runs.clear()
         if text:
-            collected.append(text)
-    return "\n".join(collected).strip()
+            finished.append(text)
+
+    def walk(index, stop, inline):
+        while index < stop:
+            _, role, name, value = nodes[index]
+            end = _subtree_end(nodes, index)
+            if role == "heading":
+                # A section heading inside the answer. It is part of what Gemini
+                # wrote, and dropping it would run two sections together.
+                end_line()
+                runs.append(name or value)
+                end_line()
+            elif role in BLOCK_ROLES:
+                end_line()
+                runs.append(value or name)
+                walk(index + 1, end, True)
+                end_line()
+            elif role == "code" and not inline:
+                end_line()
+                pieces = [value] + [child[3] or child[2] for child in nodes[index + 1:end]]
+                block = _code_block(pieces, history)
+                if block:
+                    finished.append(block)
+            elif role == "link":
+                runs.append(name or value)
+            elif role in INLINE_ROLES:
+                runs.append(value or name)
+                walk(index + 1, end, True)
+            elif role in ("button", "img", ""):
+                pass
+            elif inline and not _holds_blocks(nodes, index + 1, end):
+                if role == "generic" and value:
+                    runs.append(value)
+                walk(index + 1, end, True)
+            else:
+                # A container of blocks — a list, a table row, the page's own
+                # wrappers. What it holds is walked; its edges end a line.
+                end_line()
+                walk(index + 1, end, False)
+                end_line()
+            index = end
+
+    walk(0, len(nodes), False)
+    end_line()
+    return "\n".join(finished).strip("\n")
 
 
 def turn_complete(snapshot):
@@ -682,7 +839,7 @@ def extract_reply(snapshot, history, sent):
     message that was just sent, which is text this driver already knows.
     """
     if _last_model_turn((snapshot or "").splitlines()) >= 0:
-        return reply_block(snapshot)
+        return reply_block(snapshot, history)
     return _tail_after(history, sent, snapshot)
 
 
