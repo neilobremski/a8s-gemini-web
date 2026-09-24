@@ -1,0 +1,16 @@
+{
+  "description": "Gemini Web seat: each tell is typed into Gemini in a signed-in browser seat and Gemini's answer comes back as a tell, one conversation per correspondent. It needs an a8s-browser seat whose Chrome profile a person has already signed in to Gemini by hand — this node never signs in. Register it with the launcher path and that seat as per-node vars, e.g. `a8s add gemini ~/agents/gemini gemini-web --A8S_GEMINI_WEB=/path/to/a8s-gemini-web --A8S_GEMINI_BROWSER_SEAT=gemini-profile --A8S_GEMINI_ALLOW=example-sender` — an unset allowlist means the seat refuses everyone. Optional: `a8s vars gemini set A8S_GEMINI_MODEL '2.5 Pro'` picks a model as Gemini's own menu labels it when a conversation is created (unset takes Gemini's default), and `a8s vars gemini set A8S_GEMINI_BROWSER_CMD /path/to/a8s-browser` names the a8s-browser launcher when a wake's PATH does not carry it.",
+  "invoke": [
+    "$A8S_GEMINI_WEB",
+    "--seat", "$RECIPIENT",
+    "handle",
+    "--from", "$SENDER",
+    "--message", "$MESSAGE",
+    "--browser-seat=$A8S_GEMINI_BROWSER_SEAT?",
+    "--browser-cmd=$A8S_GEMINI_BROWSER_CMD?",
+    "--allow=$A8S_GEMINI_ALLOW?",
+    "--model=$A8S_GEMINI_MODEL?"
+  ],
+  "max_wake_seconds": 900,
+  "idle": { "timeout": 0 }
+}

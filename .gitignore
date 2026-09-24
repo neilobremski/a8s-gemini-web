@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PII patterns for this checkout only — never committed
+.github/pii-patterns.local.txt
+
+# Test and lint venv
+tests/.venv/

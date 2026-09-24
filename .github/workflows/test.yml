@@ -1,0 +1,78 @@
+name: test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    # Every merge to main bumps VERSION — patch minimum, minor or major at
+    # the author's judgment. The release tag is cut from this file.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: VERSION must be bumped past main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          head_version="$(tr -d '[:space:]' < VERSION)"
+          # An empty repo has no VERSION on main yet, so the first PR sets the
+          # baseline instead of comparing against a file that does not exist.
+          main_version="$(git show origin/main:VERSION 2>/dev/null | tr -d '[:space:]' || true)"
+          echo "this PR: $head_version"
+          echo "main:    ${main_version:-<none>}"
+          if [ -z "$head_version" ]; then
+            echo "::error file=VERSION::VERSION is empty"
+            exit 1
+          fi
+          if [ -n "$main_version" ] && [ "$head_version" = "$main_version" ]; then
+            echo "::error file=VERSION::VERSION is still $main_version. Every merge to main increments the semver — patch bump minimum, minor or major at your judgment."
+            exit 1
+          fi
+
+  lint:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned: an unpinned linter changes the gate under you when it ships a
+      # new rule, and a red check nobody caused is a check people learn to skip.
+      - run: pip install ruff==0.16.8
+      - run: ruff check .
+
+  pii-check:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check for PII in diff
+        env:
+          PII_PATTERNS: ${{ secrets.PII_PATTERNS }}
+        run: python .github/pii_check.py
+
+  tests:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m pytest tests/ -x -q
