@@ -231,17 +231,18 @@ def test_a_heading_inside_the_answer_is_its_own_line():
     assert lines(FORMATTED, FORMATTED_HISTORY)[0] == "Status Report"
 
 
-def test_a_blockquote_and_every_table_cell_are_their_own_lines():
+def test_a_blockquote_is_its_own_line_and_a_table_is_one_line_per_row():
+    """The header row too. The page renders a row as one line, and a cell per
+    line would make a table unreadable in a text reply."""
     got = lines(STRUCTURED, STRUCTURED_HISTORY)
-    assert got[3:10] == [
+    assert got[3:8] == [
         "Signal integrity verified.",
-        "Key",
-        "Value",
-        "Status",
-        "Active",
-        "Mode",
-        "Stream",
+        "Key | Value",
+        "Status | Active",
+        "Mode | Stream",
+        "Call len(x) on a list of strs, then see the docs.",
     ]
+    assert lines(STRUCTURED)[4:7] == ["Key | Value", "Status | Active", "Mode | Stream"]
 
 
 def test_a_code_block_keeps_its_newlines_and_indentation():

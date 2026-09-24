@@ -2,9 +2,9 @@
 
 ## 0.2.1
 
-- Fixed: a reply broke onto a new line at every inline piece of markup. One sentence with a citation in it arrived as three lines — `The secret word is <word>`, then `, and the shapes …`, then `.` — and inline code and links did the same. A reply is now one line per block (paragraph, list item, heading, table cell, blockquote, code block), and everything inside a block stays on its line with the spacing the page shows: `len(x)` and `strs` stay glued, and no space lands before a comma or a full stop.
+- Fixed: a reply broke onto a new line at every inline piece of markup. One sentence with a citation in it arrived as three lines — `The secret word is <word>`, then `, and the shapes …`, then `.` — and inline code and links did the same. A reply is now one line per block (paragraph, list item, heading, table row, blockquote, code block), and everything inside a block stays on its line with the spacing the page shows: `len(x)` and `strs` stay glued, and no space lands before a comma or a full stop.
 - Fixed: a code block lost its line breaks and indentation, and a multi-line block could lose its first line. The page snapshot flattens a code block, so its text now comes from the page's rendered text, where the block is as Gemini wrote it. The language label (`Python`) and the copy controls stay out of the reply.
-- Fixed: a table's header row was dropped from the reply.
+- A table arrives one row per line, its cells joined by ` | `, instead of one cell per line. Fixed: the header row was dropped; it is now the table's first line.
 
 ## 0.2.0
 

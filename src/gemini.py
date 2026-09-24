@@ -92,6 +92,9 @@ TEXT_ROLES = (*BLOCK_ROLES, *INLINE_ROLES)
 # this button; inline code never has one (observed 2026-09-24). Inside a list
 # item, it is how the wrapper holding a code block is told from an inline span.
 CODE_BLOCK_BUTTON = "Copy code"
+# A table row is one line of the reply, its cells joined by this. The header
+# row is a row like any other.
+CELL_SEPARATOR = " | "
 # Punctuation that closes onto the run before it and opens onto the run after
 # it. Only used when the page's rendered text cannot settle the spacing.
 CLOSES_ONTO = ".,;:!?)]}%\u2019\u201d\u2026"
@@ -568,7 +571,7 @@ def reply_block(snapshot, history=""):
     """The newest model turn's text, taken from the snapshot's own structure.
 
     Anchored on the last `Gemini said` heading and stopped at whatever ends the
-    turn. Inside it, a block (paragraph, list item, heading, table cell,
+    turn. Inside it, a block (paragraph, list item, heading, table row,
     blockquote, code block) is a line of its own and an inline run joins the
     line it sits in, so one sentence with a citation, a link or inline code in
     it stays one sentence. `history` is the page's rendered text from the same
@@ -616,6 +619,16 @@ def reply_block(snapshot, history=""):
             elif role in INLINE_ROLES:
                 runs.append(value or name)
                 walk(index + 1, end, True)
+            elif role == "row":
+                # One line per row, cells side by side, as the page renders it.
+                end_line()
+                first = len(finished)
+                walk(index + 1, end, False)
+                end_line()
+                cells = finished[first:]
+                del finished[first:]
+                if cells:
+                    finished.append(CELL_SEPARATOR.join(cells))
             elif role in ("button", "img", ""):
                 pass
             elif inline and not _holds_blocks(nodes, index + 1, end):
