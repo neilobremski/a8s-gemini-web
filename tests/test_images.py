@@ -3,7 +3,6 @@
 The fixtures are the live page's shape, read on 2026-09-24 from a turn that
 generated one image, with the prompt replaced by invented text.
 """
-import json
 import os
 
 from conftest import FakeGeminiSeat, ScriptedSeat
@@ -110,8 +109,9 @@ NEWEST_DOWNLOAD_ICON = "                      - img [ref=e540]: download\n"
 # not known; it is the case completion has to survive if it does.
 STILL_RENDERING = IMAGE_TURN.replace(NEWEST_DOWNLOAD + NEWEST_DOWNLOAD_ICON, "")
 
-# What the rendered text of that page looked like to the fallback, escapes and all.
-ESCAPED_HISTORY = json.dumps(f"{PROMPT}\n\nGemini said\n\n\n\n\nFlash\n\n")[1:-1]
+# The rendered text of that page after the message: headings and control
+# labels, no answer. a8s-browser 0.3.1 hands it over decoded.
+FURNITURE_HISTORY = f"{PROMPT}\n\nGemini said\n\n\n\n\nFlash\n\n"
 
 
 def _mixed(snapshot):
@@ -179,7 +179,7 @@ class TestReadiness:
 
 class TestTheReplyText:
     def test_an_image_only_turn_has_no_text_and_is_not_filled_in_from_the_page(self):
-        assert gemini.extract_reply(IMAGE_TURN, ESCAPED_HISTORY, PROMPT) == ""
+        assert gemini.extract_reply(IMAGE_TURN, FURNITURE_HISTORY, PROMPT) == ""
 
     def test_an_image_only_turn_is_never_filled_in_from_the_rendered_text(self):
         """The turn heading is on the page, so its turn is the whole answer."""
@@ -189,23 +189,19 @@ class TestTheReplyText:
     def test_text_beside_an_image_is_the_reply(self):
         assert gemini.extract_reply(_mixed(IMAGE_TURN), "", PROMPT) == "Here is your tile map."
 
-    def test_escaped_rendered_text_is_decoded(self):
-        escaped = json.dumps(f"{PROMPT}\nThe batch is green.\nlint is clean\n")[1:-1]
-        assert "\\n" in escaped
-        assert gemini.extract_reply("- generic [ref=e1]", escaped, PROMPT) == (
-            "The batch is green.\nlint is clean"
+    def test_rendered_text_is_taken_as_decoded(self):
+        """a8s-browser 0.3.1 decodes `text`; decoding again would turn a literal
+        backslash-n that is really on the page into a line break."""
+        history = f"{PROMPT}\nThe batch is green.\nprint('a\\nb')\n"
+        assert gemini.extract_reply("- generic [ref=e1]", history, PROMPT) == (
+            "The batch is green.\nprint('a\\nb')"
         )
 
     def test_furniture_is_never_a_reply(self):
         """The fallback, given the page that produced the defect, finds nothing to say."""
         no_headings = IMAGE_TURN.replace('heading "Gemini said"', 'heading "Model"')
         no_headings = no_headings.replace('heading "You said', 'heading "Asked')
-        assert gemini.extract_reply(no_headings, ESCAPED_HISTORY, PROMPT) == ""
-
-    def test_decoding_leaves_real_text_alone(self):
-        assert gemini.rendered_text("line one\nline two \\n kept") == "line one\nline two \\n kept"
-        assert gemini.rendered_text("C:\\path") == "C:\\path"
-        assert gemini.rendered_text("") == ""
+        assert gemini.extract_reply(no_headings, FURNITURE_HISTORY, PROMPT) == ""
 
 
 def _polls(tmp_path, *snapshots):
@@ -250,7 +246,6 @@ class TestCompletion:
 
 def _image_seat(tmp_path, images, reply=""):
     seat = FakeGeminiSeat(tmp_path, reply=lambda prompt: reply if prompt == PROMPT else "ack")
-    seat.escaped_text = True
 
     original = seat._do_press
 

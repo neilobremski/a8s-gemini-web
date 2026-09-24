@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import shlex
@@ -177,9 +176,6 @@ class FakeGeminiSeat:
         self.image_pending_polls = 0
         # 1-based image numbers whose download fails in the browser.
         self.download_fails = set()
-        # Rendered text as a8s-browser's `text` really returns it: a JSON string
-        # literal with its quotes taken off, so a line break is backslash-n.
-        self.escaped_text = False
 
     def run(self, script):
         self.scripts.append(script)
@@ -415,8 +411,7 @@ class FakeGeminiSeat:
         if args[0] != gemini.HISTORY_SELECTOR:
             return ""
         body = "\n".join(text for _, text in self.history)
-        body = f"{body}\nGemini is AI and can make mistakes."
-        return json.dumps(body)[1:-1] if self.escaped_text else body
+        return f"{body}\nGemini is AI and can make mistakes."
 
 
 class Outbox:

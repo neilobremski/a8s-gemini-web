@@ -611,25 +611,6 @@ def trouble(text):
     return ""
 
 
-def rendered_text(output):
-    """a8s-browser's `text` output as the text the page shows.
-
-    The verb evaluates `innerText` through playwright-cli, which reports a
-    string result as a JSON string literal, and only the surrounding quotes are
-    taken off on the way here. So a line break arrives as a backslash and an
-    `n`, and without decoding a fallback reply is sent with the escapes in it.
-    Text that already has real line breaks, or no backslash at all, is taken
-    as it is.
-    """
-    if not output or "\n" in output or "\\" not in output:
-        return output or ""
-    try:
-        decoded = json.loads(f'"{output}"')
-    except ValueError:
-        return output
-    return decoded if isinstance(decoded, str) else output
-
-
 def furniture(snapshot):
     """Labels of the page's own controls, which rendered text picks up as lines.
 
@@ -657,7 +638,6 @@ def _tail_after(history, sent, snapshot=""):
     Only lines that are not page furniture count. A tail made of nothing but
     headings and control labels is not an answer, and it is returned as "".
     """
-    history = rendered_text(history)
     if not history or not sent:
         return ""
     needle = sent.strip()
@@ -888,7 +868,7 @@ def read(browser, sent=""):
     """One look at the page: the newest reply, and whether it is finished."""
     transcript = _run(browser, poll_script(), "reading the conversation")
     snapshot = _snapshot_of(transcript, browser)
-    history = rendered_text(_first_output(transcript, "text"))
+    history = _first_output(transcript, "text")
     return Reading(
         extract_reply(snapshot, history, sent),
         turn_complete(snapshot),

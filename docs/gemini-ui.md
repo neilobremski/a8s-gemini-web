@@ -29,7 +29,7 @@ below, and put whatever it says now into the constant beside it.
 | `USER_TURN_HEADING` | `You said <prompt>`, a level-5 heading opening each human turn | observed 2026-09-23 |
 | `COMPLETION_BUTTONS` | `Good response`, `Bad response`, `Redo`, `Show more options` — the cluster a finished turn grows, and this driver's completion signal | observed 2026-09-23 |
 | `TEXT_ROLES` / `STOP_ROLES` | which snapshot roles carry reply text, and what ends a turn | reading of the snapshot format |
-| `HISTORY_SELECTOR` | `main`, read with `text` as the fallback when the headings stop matching | reading |
+| `HISTORY_SELECTOR` | `main`, read with `text` as the fallback when the headings stop matching. a8s-browser 0.3.1 returns it decoded, so it is used as it arrives; decoding it again would turn a literal backslash-n on the page into a line break | reading |
 | `node` / `_unquote` | a snapshot is YAML: a value that starts with a quote or holds a colon arrives as a quoted scalar. A cited answer splits its paragraph into `text` children around `superscript` markers, one of them `- text: ", HERON-3"`; the quotes are syntax and are removed | observed 2026-09-24 |
 | `TRAILING_NOISE` | the page's own `Gemini is AI and can make mistakes.` line | observed 2026-09-23 |
 | `conversation_id` | a new chat is `/app` with no id; after the first message the URL becomes `/app/<hex id>`, and returning is a plain `go` to it | observed 2026-09-23 |
@@ -217,14 +217,14 @@ attaching it. A picture that comes back byte-identical to one already fetched is
 reported as a failure, because it means the selector no longer tells the images
 apart.
 
-**a8s-browser 0.3.0's `download` does not see the file on a real Chrome.** On the
-live seat (2026-09-24) the selector matched the newest image's button, the click
-worked, and Chrome saved the full-size JPEG — about 13 seconds later — into its
-own download folder in the user's home directory. playwright-cli, attached to
-that Chrome over CDP, reported no download, so the verb timed out and the reply
-said `image 1 of 1 could not be downloaded`. The fix belongs in a8s-browser: the
-seat's Chrome has to save downloads where the verb looks. This driver does not
-watch a shared download folder itself.
+**The download needs a8s-browser 0.3.1.** The seat's Chrome is a real Chrome
+attached over CDP, and it saves a download into its own download folder unless
+told otherwise, where a8s-browser 0.3.0's `download` does not see it and times out.
+0.3.1 points the seat's downloads at the seat's own directory, waits for the
+finished file and reports its path. Live on 2026-09-24 with 0.3.1: a generated
+2048x2048 JPEG came back through the verb, was copied into the turn's directory
+byte for byte, and was attached; nothing landed in the user's own download
+folder. This driver never watches a shared download folder itself.
 
 Not covered: documents and code Gemini builds in Canvas, and anything reached
 through `Export to Docs`. Those use other controls, and the response-actions

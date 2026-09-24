@@ -10,8 +10,9 @@ Gemini by hand, once; this driver only types.
 
 ## Before it will work
 
-[a8s-browser](https://github.com/neilobremski/a8s-browser) 0.3.0 or later
-(for its `upload` and `download` verbs) installed and on `PATH`, with one of its
+[a8s-browser](https://github.com/neilobremski/a8s-browser) 0.3.1 or later
+(for its `upload` and `download` verbs, and its decoded `text`) installed and on
+`PATH`, with one of its
 seats already signed in to Gemini:
 
 ```bash
@@ -136,11 +137,6 @@ it made. The driver waits until each image in the turn has its own download
 control before it counts the turn as finished, downloads each one through
 a8s-browser, and names any image that did not come back in the reply.
 Documents and code that Gemini builds in Canvas do not come back as files.
-
-This needs an a8s-browser whose `download` reports what its Chrome saved. With
-a8s-browser 0.3.0 against a real Chrome, the click works but Chrome saves the
-image to its own download folder, the verb does not see it, and the reply says
-the image could not be downloaded.
 
 Selecting a model is best effort — it is one of Gemini's Angular menus, and a
 seat that cannot switch keeps the turn and runs on the default.
