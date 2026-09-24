@@ -1122,22 +1122,29 @@ def _composer(lines):
 def chips(snapshot, names):
     """What the composer shows for these files, or None when there is no composer.
 
-    Returns `(labels, images)`: how many times each file's `chip_label` appears
-    in the composer, as a tuple, and how many image thumbnails it holds. Counts
-    rather than presence, and read against a baseline taken before the upload,
-    so text already in the composer never confirms anything.
+    Returns `(labels, images)`. `labels` has one entry per file: how many
+    document-chip labels in the composer read exactly that file's `chip_label`.
+    `images` is how many image thumbnails the composer holds.
+
+    Only chip nodes are read. A document chip's label is the value of a
+    `generic` node (`- generic: probe-note`); a thumbnail is an `img
+    "attachment"` node. Nothing else in the composer is evidence — not the
+    thumbnail's own name, not the prompt the sender typed, not the snapshot's
+    YAML — so a file called `attachment.pdf` is never confirmed by a picture,
+    and a short name is never confirmed by the text around it.
     """
     composer = _composer((snapshot or "").splitlines())
     if composer is None:
         return None
-    text = "\n".join(composer)
-    labels = tuple(text.count(chip_label(name)) for name in names)
+    found = {}
     images = 0
     for line in composer:
-        role, name, _ = node(line)
+        role, name, value = node(line)
         if role == "img" and name == IMAGE_CHIP_NAME:
             images += 1
-    return labels, images
+        elif role == "generic" and not name and value:
+            found[value] = found.get(value, 0) + 1
+    return tuple(found.get(chip_label(name), 0) for name in names), images
 
 
 def _chip_kind(name):
@@ -1150,23 +1157,41 @@ def _chip_kind(name):
 
 
 def uploads_shown(before, after, names):
-    """Whether the composer shows every file of this upload.
+    """Whether the composer shows every file of this upload, each by a chip of its own.
 
-    A named chip must appear once more for each document. Image thumbnails must
-    rise by the number of images. A type that could be shown either way may be
-    either, but the total still has to rise by one for each of those files, so
-    one chip is never taken as proof of two uploads.
+    Evidence is what is new since the baseline, and each new chip or thumbnail
+    is given to **one** file at most — a matching, not a count per file. Two
+    files whose labels read the same need two new chips with that label.
+
+    - A document takes one new chip carrying its label.
+    - An image takes one new thumbnail.
+    - A type nobody has watched land takes one of whichever is left: a new chip
+      with its own label first, since only it can use that, then a thumbnail.
     """
     (was_labels, was_images), (labels, images) = before, after
-    rise = [now - was for now, was in zip(labels, was_labels, strict=True)]
     kinds = [_chip_kind(name) for name in names]
-    if any(up < 1 for up, kind in zip(rise, kinds, strict=True) if kind == "named"):
+    new_labels = {}
+    for name, now, was in zip(names, labels, was_labels, strict=True):
+        new_labels[chip_label(name)] = now - was
+    for name, kind in zip(names, kinds, strict=True):
+        if kind == "named":
+            new_labels[chip_label(name)] -= 1
+    if any(left < 0 for left in new_labels.values()):
         return False
-    spare = images - was_images - kinds.count("image")
-    if spare < 0:
+    thumbnails = images - was_images - kinds.count("image")
+    if thumbnails < 0:
         return False
-    either = [up for up, kind in zip(rise, kinds, strict=True) if kind == "either"]
-    return spare + sum(1 for up in either if up > 0) >= len(either)
+    for name, kind in zip(names, kinds, strict=True):
+        if kind != "either":
+            continue
+        label = chip_label(name)
+        if new_labels[label] > 0:
+            new_labels[label] -= 1
+        elif thumbnails > 0:
+            thumbnails -= 1
+        else:
+            return False
+    return True
 
 
 def upload_script(path):

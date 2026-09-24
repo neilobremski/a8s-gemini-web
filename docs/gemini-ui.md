@@ -154,12 +154,19 @@ step as signing the profile in, and it belongs to whoever owns the account.
 A document's chip is a clickable `generic` holding `generic: TXT` and `generic:
 probe-note` for `probe-note.txt`: the name without its extension, and a long name
 shortened to its first and last ten characters around `...`. An image's chip is
-a thumbnail, `img "attachment"`, with no name at all. So the confirmation counts,
-per file, what that file shows: its `chip_label` for a document, one more
-thumbnail for each `.png`/`.jpg`/`.jpeg`/`.webp`/`.gif`. A type nobody has
-watched land (`.svg`, `.heic` and the like) may show either, but the total still
-has to rise by one for each such file, so one chip never stands for two
-uploads.
+a thumbnail, `img "attachment"`, with no name at all.
+
+Only chip nodes are evidence: a document chip is the value of a `generic` node
+that reads exactly the file's `chip_label`, and a thumbnail is an `img
+"attachment"` node. The thumbnail's own name, the prompt the sender typed and the
+snapshot's syntax are never matched against a filename — so `attachment.pdf` is
+not confirmed by a picture, and a short name is not confirmed by text that
+happens to contain it. Each new chip is then given to **one** file at most: a
+document takes a new chip with its label, each `.png`/`.jpg`/`.jpeg`/`.webp`/`.gif`
+takes a new thumbnail, and a type nobody has watched land (`.svg`, `.heic` and
+the like) takes whichever is left — a chip with its own label first, then a
+thumbnail. Two files whose labels read the same need two chips, and one
+thumbnail never stands for two files.
 
 **The upload confirmation asks the composer, not only the chip.** The snapshot is
 the whole page, so three readings are wrong and one is right.

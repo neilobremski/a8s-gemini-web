@@ -1,4 +1,5 @@
 """A tell that carries files, from the message body into the conversation."""
+import os
 import shlex
 
 from test_handler import answer
@@ -441,3 +442,54 @@ class TestImageUploads:
         assert code == 1
         assert _asked(seat) == []
         assert "did not finish uploading" in outbox.last
+
+
+class TestEachChipCountsOnce:
+    """Evidence is chip nodes, and each new chip is given to one file at most."""
+
+    def test_a_thumbnail_never_confirms_a_document_named_attachment(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        class LosesTheDocument(type(seat)):
+            def _do_upload(self, args):
+                if os.path.basename(args[0]) == "attachment.pdf":
+                    self.chooser_open = False  # the chooser took it; the page never shows it
+                    return "attachment.pdf"
+                return super()._do_upload(args)
+
+        seat = LosesTheDocument(tmp_path)
+        doc = _attached(tmp_path, "attachment.pdf", b"%PDF")
+        pic = _attached(tmp_path, "photo.jpg", b"\xff\xd8")
+        code = answer("gemini", "example-sender", _with_files("compare", doc, pic), outbox, seat)
+        assert seat.attached == ["photo.jpg"]
+        assert code == 1
+        assert _asked(seat) == []
+        assert "attached to this turn" not in outbox.last
+
+    def test_one_thumbnail_is_not_two_files_of_either_kind(self):
+        names = ["attachment.svg", "chart.svg"]
+        before = gemini.chips(EMPTY_COMPOSER, names)
+        after = gemini.chips(IMAGE_IN_COMPOSER, names)
+        assert after == ((0, 0), 1)
+        assert not gemini.uploads_shown(before, after, names)
+
+    def test_two_documents_with_one_label_need_two_chips(self):
+        names = ["report.pdf", "report.docx"]
+        chip = (
+            "            - generic [ref=f1e590] [cursor=pointer]:\n"
+            "              - generic [ref=f1e591]: PDF\n"
+            "              - generic [ref=f1e592]: report\n"
+        )
+        anchor = '            - img "attachment" [ref=f1e584]\n'
+        one = IMAGE_IN_COMPOSER.replace(anchor, chip)
+        two = IMAGE_IN_COMPOSER.replace(anchor, chip + chip)
+        before = gemini.chips(EMPTY_COMPOSER, names)
+        assert not gemini.uploads_shown(before, gemini.chips(one, names), names)
+        assert gemini.uploads_shown(before, gemini.chips(two, names), names)
+
+    def test_the_prompt_and_the_page_furniture_are_not_chips(self):
+        """A short name matches plenty of text; only a chip's own value counts."""
+        names = ["what.txt", "arrow_upward.txt", "plus.txt"]
+        before = gemini.chips(EMPTY_COMPOSER, names)
+        assert before == ((0, 0, 0), 0)
+        assert not gemini.uploads_shown(before, gemini.chips(IMAGE_IN_COMPOSER, names), names)
