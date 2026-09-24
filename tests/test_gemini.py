@@ -83,6 +83,13 @@ def test_a_snapshot_line_parses_into_role_name_and_value():
     assert gemini.node("not a node") == ("", "", "")
 
 
+def test_a_quoted_yaml_value_is_read_as_the_text_it_quotes():
+    """Live, 2026-09-24: a cited answer split into text nodes, one of them quoted."""
+    assert gemini.node('- text: ", HERON-3"') == ("text", "", ", HERON-3")
+    assert gemini.node("- text: 'it''s here: now'") == ("text", "", "it's here: now")
+    assert gemini.node('- paragraph: "unbalanced') == ("paragraph", "", '"unbalanced')
+
+
 def test_the_prompt_box_is_the_textbox_that_says_what_it_is_for():
     snapshot = (
         '- textbox "Search" [ref=e1]\n'

@@ -105,13 +105,16 @@ def test_two_correspondents_get_two_conversations(seat, outbox, clock, state_hom
     assert sessions["example-sender"]["url"] != sessions["other"]["url"]
 
 
-def test_a_conversation_deleted_in_gemini_is_replaced_and_said_out_loud(
+def test_a_conversation_that_does_not_open_is_replaced_and_said_out_loud(
     seat, outbox, clock, state_home
 ):
     SessionStore("gemini").remember("example-sender", "https://gemini.google.com/app/gone")
     assert answer("gemini", "example-sender", "hello", outbox, seat) == 0
 
     assert "not usable" in outbox.last
+    # Landing somewhere else is not proof the conversation was deleted.
+    assert "could not be opened" in outbox.last
+    assert "deleted" not in outbox.last
     assert gemini.conversation_id(SessionStore("gemini").get("example-sender")["url"]) != "gone"
     assert "ack: hello" in outbox.last
 

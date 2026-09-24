@@ -11,6 +11,7 @@ Going the other way, a file this seat produces has to be named before it can be
 sent, and the name may have come from a web page. So every name is reduced to a
 single safe path segment here rather than wherever it happens to be used.
 """
+import hashlib
 import os
 import re
 import shutil
@@ -122,6 +123,42 @@ def read(message, work_dir):
         if note:
             notes.append(note)
     return Incoming(prose, whole, notes)
+
+
+# a8s-browser names an artifact `<YYYYMMDDTHHMMSS>-<name>`. The stamp is its
+# bookkeeping, not part of the file the page handed over.
+ARTIFACT_STAMP = re.compile(r"^\d{8}T\d{6}-")
+
+
+def digest(path):
+    """The sha256 of a file's bytes."""
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def keep(source, directory, taken, fallback):
+    """Copy one file this seat is about to send into a directory it owns.
+
+    Returns `(path, note)`: the copy, or "" and a sentence naming the file that
+    could not be kept. The name came from a web page and will land on the
+    sender's disk, so it is reduced by `safe_name`, and it is made unique
+    against `taken` (lower-cased names, updated here) — two images Gemini names
+    alike must arrive as two files.
+    """
+    name = safe_name(ARTIFACT_STAMP.sub("", os.path.basename(source)), fallback)
+    stem, ext = os.path.splitext(name)
+    candidate, bump = name, 1
+    while candidate.lower() in taken:
+        bump += 1
+        candidate = f"{stem}-{bump}{ext}"
+    target = os.path.join(directory, candidate)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        shutil.copyfile(source, target)
+    except OSError as exc:
+        return "", f"{candidate} was downloaded but could not be kept for sending ({exc})."
+    taken.add(candidate.lower())
+    return target, ""
 
 
 def safe_name(name, fallback=FALLBACK_NAME):

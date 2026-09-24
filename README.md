@@ -10,8 +10,10 @@ Gemini by hand, once; this driver only types.
 
 ## Before it will work
 
-[a8s-browser](https://github.com/neilobremski/a8s-browser) installed and on
-`PATH`, with one of its seats already signed in to Gemini:
+[a8s-browser](https://github.com/neilobremski/a8s-browser) 0.3.1 or later
+(for its `upload` and `download` verbs, and its decoded `text`) installed and on
+`PATH`, with one of its
+seats already signed in to Gemini:
 
 ```bash
 a8s-browser -s gemini-profile open      # a real Chrome window on a fresh profile
@@ -32,7 +34,7 @@ and nothing attaches until somebody presses `Agree`. Do it once, in the same
 window you signed in with:
 
 ```bash
-a8s-browser -s gemini-profile open      # drag any file into the prompt box
+a8s-browser -s gemini-profile open      # attach any file with the + button
 # press Agree in the dialog that appears
 ```
 
@@ -106,17 +108,17 @@ a8s-gemini-web --seat gemini forget example-sender       # the next tell starts 
 Conversations are remembered in `$XDG_STATE_HOME/a8s-gemini-web` (or
 `~/.local/share/a8s-gemini-web`), one small JSON file per node.
 
-## What v1 does
+## What it does
 
-Text in, text out, and files in.
+Text in, text out, files in, and generated images out.
 
 ```bash
 tell gemini --attach report.pdf "what does this say about margins?"
 ```
 
 a8s delivers the file to this machine and names it in the message; the driver
-takes the path back out of the prose, drops the file into the composer, waits
-for Gemini to show it, and only then sends. Nothing is submitted until the file
+takes the path back out of the prose, puts the file in through Gemini's own
+`Upload files` menu, waits for Gemini to show it, and only then sends. Nothing is submitted until the file
 is in the page, because a question about a document Gemini never received reads
 as a model failure and costs a turn to discover. A file over `tell`'s size cap
 arrives as `--split` parts and is joined back together here; a set with a part
@@ -125,12 +127,16 @@ missing is refused and named rather than joined short.
 A reply too long for the message cap comes back as `gemini-reply.md` attached,
 instead of being cut.
 
-**Files out are not done.** A generated image or a downloadable artifact does not
-come back yet: `img` is not one of the roles reply extraction reads, so the image
-is invisible to the driver. The machinery is in place — a8s-browser has a
-`download` verb and held replies carry attachments — and
-[`docs/gemini-ui.md`](docs/gemini-ui.md) lists exactly what has to be observed on
-a live page to finish it.
+```bash
+tell gemini "draw a small red square on a white background"
+```
+
+An image Gemini generates comes back as an attachment, with whatever Gemini
+wrote beside it — or, for a turn with no words, a line saying how many images
+it made. The driver waits until each image in the turn has its own download
+control before it counts the turn as finished, downloads each one through
+a8s-browser, and names any image that did not come back in the reply.
+Documents and code that Gemini builds in Canvas do not come back as files.
 
 Selecting a model is best effort — it is one of Gemini's Angular menus, and a
 seat that cannot switch keeps the turn and runs on the default.

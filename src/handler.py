@@ -42,6 +42,10 @@ MAX_BODY = 4000
 # message text, so it is not what the cap is protecting against.
 LONG_REPLY_NAME = "gemini-reply.md"
 
+# Where a turn's generated images are copied before they are attached, inside
+# the turn's own work directory.
+OUTBOUND_DIR = "out"
+
 # Body room given back when the whole reply travels as a file. `_compose` caps
 # the body and its notes together, so an excerpt that fills the cap exactly
 # would push out the note saying where the rest of the answer went.
@@ -88,18 +92,37 @@ def _tell(recipient, body, files=()):
         return 127
 
 
+CUT_MARK = "\n… (cut at this seat's reply cap)"
+
+
 def _capped(body):
     if len(body) <= MAX_BODY:
         return body
-    return body[: MAX_BODY - 40].rstrip() + "\n… (cut at this seat's reply cap)"
+    return body[: MAX_BODY - 40].rstrip() + CUT_MARK
+
+
+def _notes_block(notes):
+    kept = [note for note in notes if note]
+    return "--\n" + "\n".join(kept) if kept else ""
 
 
 def _compose(reply, notes):
-    parts = [reply.strip()] if reply.strip() else []
-    kept = [note for note in notes if note]
-    if kept:
-        parts.append("--\n" + "\n".join(kept))
-    return _capped("\n\n".join(parts))
+    """The body: the reply, then the notes — and the notes always survive the cap.
+
+    The notes are what the seat says about delivery: an image that did not
+    download, a file that was not held, where the rest of a long answer went.
+    Cutting from the end would cut exactly those, so when the two do not fit
+    together it is the reply that is shortened.
+    """
+    head = reply.strip()
+    tail = _notes_block(notes)
+    body = "\n\n".join(part for part in (head, tail) if part)
+    if len(body) <= MAX_BODY:
+        return body
+    room = MAX_BODY - len(tail) - len(CUT_MARK) - 2
+    if not head or room <= 0:
+        return _capped(tail or head)
+    return head[:room].rstrip() + CUT_MARK + "\n\n" + tail
 
 
 def _status(send, recipient, body, files=()):
@@ -307,7 +330,10 @@ def _as_body_and_files(reply, notes, work_dir):
     flooding a mailbox, and a file does not sit in the message text, so sending
     the whole thing as one costs the cap nothing.
     """
-    if len(reply) <= MAX_BODY:
+    tail = _notes_block(notes)
+    if len(reply) + (len(tail) + 2 if tail else 0) <= MAX_BODY:
+        # Decided on the combined size: an answer that fits alone but not with
+        # its notes beside it would otherwise lose its end to the cap.
         return reply, []
     path = os.path.join(work_dir, LONG_REPLY_NAME)
     try:
@@ -320,8 +346,9 @@ def _as_body_and_files(reply, notes, work_dir):
         )
         return reply, []
     notes.append(
-        f"Gemini's answer is {len(reply)} characters, past this seat's {MAX_BODY}-character "
-        f"reply cap, so the whole of it is attached as {LONG_REPLY_NAME} rather than cut."
+        f"Gemini's answer is {len(reply)} characters, which with this seat's notes is "
+        f"past its {MAX_BODY}-character reply cap, so the whole of it is attached as "
+        f"{LONG_REPLY_NAME} rather than cut."
     )
     return reply[: MAX_BODY - LONG_REPLY_RESERVE].rstrip(), [path]
 
@@ -364,7 +391,71 @@ def _turn(seat, sender, message, runner, store, model, send, outbox):
     hit = gemini.trouble(turn.reply)
     if hit:
         notes.append(f"Gemini's own trouble wording is in this reply ({hit!r}).")
-    reply = turn.reply.strip() or f"{seat}: nothing came back from Gemini for this message."
+    images, lost = _fetch_images(runner, turn.images, work_dir)
+    notes.extend(lost)
+    reply = turn.reply.strip() or _images_line(turn.images, images) or (
+        f"{seat}: nothing came back from Gemini for this message."
+    )
     body, files = _as_body_and_files(reply, notes, work_dir)
-    _deliver(send, outbox, sender, _compose(body, notes), files)
+    _deliver(send, outbox, sender, _compose(body, notes), files + images)
     return 0
+
+
+def _fetch_images(runner, count, work_dir):
+    """Download a turn's generated images into this turn's own directory.
+
+    Returns `(paths, notes)`, a note naming each image that did not come back.
+
+    Each image is copied out of a8s-browser's artifacts **before the next one is
+    asked for**, and the copy is checked against the bytes the download
+    produced. An artifact path is the browser's to reuse: two quick downloads
+    with one name can land on the same path, and a copy made afterwards would
+    send the second picture twice under two names. A picture byte-identical to
+    one already kept is a failure too, because it means the selector no longer
+    tells this turn's images apart.
+    """
+    if not count:
+        return [], []
+    directory = os.path.join(work_dir, OUTBOUND_DIR)
+    taken = {LONG_REPLY_NAME}
+    seen = {}
+    kept = []
+    notes = []
+    for index in range(1, count + 1):
+        which = f"image {index} of {count}"
+        source, failure = gemini.download_image(runner, index, count)
+        if failure:
+            notes.append(failure)
+            continue
+        try:
+            fetched = attachments.digest(source)
+        except OSError as exc:
+            notes.append(f"{which} could not be downloaded: {exc}")
+            continue
+        if fetched in seen:
+            notes.append(
+                f"{which} could not be downloaded: the page handed back image "
+                f"{seen[fetched]} again, so this seat cannot reach the others"
+            )
+            continue
+        path, note = attachments.keep(source, directory, taken, f"image-{index}")
+        if note:
+            notes.append(note)
+            continue
+        if attachments.digest(path) != fetched:
+            os.unlink(path)
+            notes.append(f"{which} changed while it was being kept, so it is not attached.")
+            continue
+        seen[fetched] = index
+        kept.append(path)
+    return kept, notes
+
+
+def _images_line(made, attached):
+    """What an image-only answer says in words, since Gemini wrote none."""
+    if not made:
+        return ""
+    noun = "image" if made == 1 else "images"
+    if len(attached) == made:
+        return f"Generated {made} {noun}."
+    return f"Gemini generated {made} {noun}; {len(attached)} attached."
