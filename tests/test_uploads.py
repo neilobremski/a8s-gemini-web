@@ -162,9 +162,14 @@ class TestTheUploadMenu:
         # Read off the live chip for a 47-character name.
         long_name = "a-rather-long-file-name-for-the-chip-check-2026.txt"
         assert gemini.chip_label(long_name) == "a-rather-l...check-2026"
-        chip = "- generic [ref=e1] [cursor=pointer]:\n  - generic [ref=e2]: TXT\n" \
-            "  - generic [ref=e3]: probe-note\n"
-        assert gemini._name_counts(chip, ["probe-note.txt"]) == (1,)
+        composer = (
+            "- group [ref=e0]:\n"
+            "  - generic [ref=e1] [cursor=pointer]:\n"
+            "    - generic [ref=e2]: TXT\n"
+            "    - generic [ref=e3]: probe-note\n"
+            '  - textbox "Enter a prompt for Gemini" [ref=e4]\n'
+        )
+        assert gemini.chips(composer, ["probe-note.txt"]) == ((1,), 0)
 
 
 class TestConsent:
@@ -332,3 +337,107 @@ class TestConfirmationIsNotJustTheName:
         code = answer("gemini", "example-sender", _with_files("second", path), outbox, seat)
         assert code == 0
         assert _asked(seat)[-1] == "second"
+
+
+# The composer as the live page drew it at 08:52 PDT on 2026-09-24, after an
+# image went in through the chooser: a thumbnail, and no filename anywhere.
+IMAGE_IN_COMPOSER = """\
+      - generic [ref=f1e700]:
+        - heading "Gemini said" [level=6] [ref=f1e701]
+        - generic [ref=f1e702]:
+          - button [ref=f1e703] [cursor=pointer]:
+            - img [ref=f1e704]
+      - generic [ref=f1e579]:
+        - group [ref=f1e580]:
+          - generic [ref=f1e583]:
+            - img "attachment" [ref=f1e584]
+            - textbox "Enter a prompt for Gemini" [active] [ref=f1e589]:
+              - paragraph [ref=f1e590]: what is in this picture?
+            - button "Upload & tools" [ref=f1e596] [cursor=pointer]:
+              - img [ref=f1e598]: plus
+            - generic [ref=f1e600]:
+              - button "Send message" [ref=f1e601] [cursor=pointer]:
+                - img [ref=f1e602]: arrow_upward
+        - paragraph [ref=f1e624]: Gemini is AI and can make mistakes.
+"""
+EMPTY_COMPOSER = IMAGE_IN_COMPOSER.replace('            - img "attachment" [ref=f1e584]\n', "")
+PICTURE = "Gemini_Generated_Image_abc123.jpeg"
+
+
+class TestImageUploads:
+    """An image's chip is a thumbnail: `img "attachment"`, no name (live, 2026-09-24)."""
+
+    def test_an_image_thumbnail_in_the_composer_confirms_the_upload(self):
+        before = gemini.chips(EMPTY_COMPOSER, [PICTURE])
+        after = gemini.chips(IMAGE_IN_COMPOSER, [PICTURE])
+        assert before == ((0,), 0)
+        assert after == ((0,), 1)
+        assert gemini.uploads_shown(before, after, [PICTURE])
+
+    def test_only_the_composer_is_counted(self):
+        """The conversation carries pictures too, and one there is not an upload."""
+        in_history = EMPTY_COMPOSER.replace(
+            "            - img [ref=f1e704]\n",
+            '            - img "attachment" [ref=f1e704]\n',
+        )
+        assert gemini.chips(in_history, [PICTURE]) == ((0,), 0)
+
+    def test_a_thumbnail_in_the_composer_is_not_a_picture_gemini_drew(self):
+        assert gemini._image_tiles(gemini._newest_turn(IMAGE_IN_COMPOSER)) == 1
+        assert not any("attachment" in line for line in gemini._newest_turn(IMAGE_IN_COMPOSER))
+
+    def test_two_images_need_two_thumbnails(self):
+        names = ["a.png", "b.jpg"]
+        before = gemini.chips(EMPTY_COMPOSER, names)
+        one = gemini.chips(IMAGE_IN_COMPOSER, names)
+        assert not gemini.uploads_shown(before, one, names)
+        two = IMAGE_IN_COMPOSER.replace(
+            '            - img "attachment" [ref=f1e584]\n',
+            '            - img "attachment" [ref=f1e584]\n'
+            '            - img "attachment" [ref=f1e585]\n',
+        )
+        assert gemini.uploads_shown(before, gemini.chips(two, names), names)
+
+    def test_a_type_that_could_be_either_counts_either_chip_but_only_once(self):
+        names = ["diagram.svg", "chart.svg"]
+        before = gemini.chips(EMPTY_COMPOSER, names)
+        one_thumb = gemini.chips(IMAGE_IN_COMPOSER, names)
+        assert not gemini.uploads_shown(before, one_thumb, names)
+        named = IMAGE_IN_COMPOSER.replace(
+            '            - img "attachment" [ref=f1e584]\n',
+            '            - img "attachment" [ref=f1e584]\n'
+            "            - generic [ref=f1e585] [cursor=pointer]:\n"
+            "              - generic [ref=f1e586]: SVG\n"
+            "              - generic [ref=f1e587]: chart\n",
+        )
+        assert gemini.uploads_shown(before, gemini.chips(named, names), names)
+
+    def test_a_page_with_no_composer_group_has_no_chips_to_count(self):
+        flat = '- textbox "Enter a prompt for Gemini" [ref=e1]\n- img "attachment" [ref=e2]\n'
+        assert gemini.chips(flat, [PICTURE]) is None
+
+    def test_an_image_upload_is_confirmed_end_to_end(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        path = _attached(tmp_path, PICTURE, b"\xff\xd8\xff\xe0jpeg")
+        code = answer("gemini", "example-sender", _with_files("what is this?", path), outbox, seat)
+        assert code == 0
+        assert _asked(seat)[-1] == "what is this?"
+        assert seat.attached == [PICTURE]
+
+    def test_a_document_and_an_image_together(self, tmp_path, seat, outbox, clock, state_home):
+        doc = _attached(tmp_path, "notes.txt")
+        pic = _attached(tmp_path, "photo.png", b"\x89PNG")
+        code = answer("gemini", "example-sender", _with_files("compare", doc, pic), outbox, seat)
+        assert code == 0
+        assert seat.attached == ["notes.txt", "photo.png"]
+
+    def test_an_image_that_never_shows_keeps_the_message(
+        self, tmp_path, seat, outbox, clock, state_home
+    ):
+        seat.upload_polls = 10_000
+        path = _attached(tmp_path, PICTURE, b"\xff\xd8")
+        code = answer("gemini", "example-sender", _with_files("what is this?", path), outbox, seat)
+        assert code == 1
+        assert _asked(seat) == []
+        assert "did not finish uploading" in outbox.last

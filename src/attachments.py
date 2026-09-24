@@ -11,6 +11,7 @@ Going the other way, a file this seat produces has to be named before it can be
 sent, and the name may have come from a web page. So every name is reduced to a
 single safe path segment here rather than wherever it happens to be used.
 """
+import hashlib
 import os
 import re
 import shutil
@@ -129,35 +130,35 @@ def read(message, work_dir):
 ARTIFACT_STAMP = re.compile(r"^\d{8}T\d{6}-")
 
 
-def adopt(sources, directory, taken=()):
-    """Copy files this seat is about to send into a directory it owns.
+def digest(path):
+    """The sha256 of a file's bytes."""
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
 
-    Returns `(paths, notes)`. Each name is reduced by `safe_name`, because it
-    came from a web page and will land on the sender's disk, and made unique
-    within the directory and against `taken` — two images Gemini names alike
-    must arrive as two files. A file that cannot be copied is named in a note
-    rather than dropped.
+
+def keep(source, directory, taken, fallback):
+    """Copy one file this seat is about to send into a directory it owns.
+
+    Returns `(path, note)`: the copy, or "" and a sentence naming the file that
+    could not be kept. The name came from a web page and will land on the
+    sender's disk, so it is reduced by `safe_name`, and it is made unique
+    against `taken` (lower-cased names, updated here) — two images Gemini names
+    alike must arrive as two files.
     """
-    used = {name.lower() for name in taken}
-    paths = []
-    notes = []
-    for index, source in enumerate(sources, 1):
-        name = safe_name(ARTIFACT_STAMP.sub("", os.path.basename(source)), f"image-{index}")
-        stem, ext = os.path.splitext(name)
-        candidate, bump = name, 1
-        while candidate.lower() in used:
-            bump += 1
-            candidate = f"{stem}-{bump}{ext}"
-        try:
-            os.makedirs(directory, exist_ok=True)
-            target = os.path.join(directory, candidate)
-            shutil.copyfile(source, target)
-        except OSError as exc:
-            notes.append(f"{candidate} was downloaded but could not be kept for sending ({exc}).")
-            continue
-        used.add(candidate.lower())
-        paths.append(target)
-    return paths, notes
+    name = safe_name(ARTIFACT_STAMP.sub("", os.path.basename(source)), fallback)
+    stem, ext = os.path.splitext(name)
+    candidate, bump = name, 1
+    while candidate.lower() in taken:
+        bump += 1
+        candidate = f"{stem}-{bump}{ext}"
+    target = os.path.join(directory, candidate)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        shutil.copyfile(source, target)
+    except OSError as exc:
+        return "", f"{candidate} was downloaded but could not be kept for sending ({exc})."
+    taken.add(candidate.lower())
+    return target, ""
 
 
 def safe_name(name, fallback=FALLBACK_NAME):

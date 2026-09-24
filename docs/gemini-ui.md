@@ -40,7 +40,9 @@ below, and put whatever it says now into the constant beside it.
 | `TROUBLE_PHRASES` | `couldn't generate`, `something went wrong` | b3t |
 | `CONSENT_HEADING` | `Creating content from images and files` — the dialog Gemini raises the first time a profile attaches anything, with `Cancel` and `Agree`. Until a person presses Agree, no file lands | observed 2026-09-23 |
 | `UPLOAD_MENU_SELECTOR` / `UPLOAD_MENU_ITEM` | uploading: `click 'button[aria-label="Upload & tools"]'` opens a `menu "Menu options"`; `click "Upload files"` picks its `menuitem "Upload files. Documents, data, code files"`, which opens a file chooser; `upload <abs path>` answers it. One file per chooser, before the submitting keystroke | observed 2026-09-24 |
-| `chip_label` | the attachment chip: a `generic [cursor=pointer]` above the prompt box holding `generic: TXT` (the extension, in capitals) and `generic: probe-note` (the name **without** its extension). No `Remove` button and no progress node showed for a small text file | observed 2026-09-24 |
+| `IMAGE_CHIP_NAME` | an uploaded **image** (a `.jpeg`, and a `.png` in a second upload) shows in the composer as a thumbnail, `img "attachment"`, a sibling of the prompt box, with **no filename anywhere**. Only the composer is read for it — the conversation carries pictures too | observed 2026-09-24 |
+| `_composer` | the composer is the `group` that holds the prompt box; chips, the prompt box and `Send message` sit inside it, the conversation outside it | observed 2026-09-24 |
+| `chip_label` | the attachment chip for a document: a `generic [cursor=pointer]` above the prompt box holding `generic: TXT` (the extension, in capitals) and `generic: probe-note` (the name **without** its extension). No `Remove` button and no progress node showed for a small text file | observed 2026-09-24 |
 | `SEND_BUTTON_NAME` | `Send message` — a button in the composer, with an `img: arrow_upward`. **It does not exist while the prompt box is empty**, and appears once there is text. A snapshot marks a disabled node with a trailing `[disabled]`, so this is the page's own answer to "will you send this now" | observed 2026-09-23 |
 | `IMAGE_DOWNLOAD_NAME` | a generated image inside a model turn is an unnamed `button` wrapping an `img` with no value — unnamed on one page, named `", AI generated"` on another — followed by that image's own `button "Share image"`, `button "Copy image"` and `button "Download full size image"`. One download button per image | observed 2026-09-24 |
 | `IMAGE_CONTROL_NAMES` | the image turn's rating cluster is `Good response`, `Bad response`, `Redo` (newest turn only), `Share image`, `Show more options` — **no `Copy`**, which a text turn's cluster has | observed 2026-09-24 |
@@ -147,10 +149,17 @@ rights in uploaded content. This driver detects it and says so; it does not
 press Agree. Accepting terms on an account is the same kind of one-time, by-hand
 step as signing the profile in, and it belongs to whoever owns the account.
 
-**The chip shows the name without its extension.** A clickable `generic` above
-the prompt box, holding `generic: TXT` and `generic: probe-note` for a file named
-`probe-note.txt`. The full filename is not in it, so `chip_label` — the name with
-its extension removed — is what the confirmation counts.
+**What a chip looks like depends on the file.** Chips sit in the composer — the
+`group` that holds the prompt box — and nothing outside that group is counted.
+A document's chip is a clickable `generic` holding `generic: TXT` and `generic:
+probe-note` for `probe-note.txt`: the name without its extension, and a long name
+shortened to its first and last ten characters around `...`. An image's chip is
+a thumbnail, `img "attachment"`, with no name at all. So the confirmation counts,
+per file, what that file shows: its `chip_label` for a document, one more
+thumbnail for each `.png`/`.jpg`/`.jpeg`/`.webp`/`.gif`. A type nobody has
+watched land (`.svg`, `.heic` and the like) may show either, but the total still
+has to rise by one for each such file, so one chip never stands for two
+uploads.
 
 **The upload confirmation asks the composer, not only the chip.** The snapshot is
 the whole page, so three readings are wrong and one is right.
@@ -169,9 +178,11 @@ next, so a settle proves only that nothing moved.
 disabled while the upload runs and enabled when it is done. That is positive
 evidence about the current composer rather than the absence of a marker.
 
-So `attach` requires **one more occurrence of each chip label than a baseline
-taken before the upload** — which stops history confirming anything, while still
-letting the same file be sent twice — **and** `send_ready(snapshot) is True`.
+So `attach` requires **the composer's chips to rise over a baseline taken before
+the upload** — which stops anything already there confirming it, while still
+letting the same file be sent twice — **and** `send_ready(snapshot) is True`. A
+page with no composer group has no chips to count, and that is the same answer
+as a missing send control: unknown, never ready.
 
 `send_ready` has three answers, and the third is the point. `True` ready, `False`
 not yet, and **`None` for no evidence either way**, which is never treated as
@@ -212,10 +223,11 @@ no container after it) and `div.generated-images`, taking the Nth child that
 holds a download button. a8s-browser acts on the first visible match of a CSS
 selector, and older exchanges keep their download buttons, which is why the
 selector is scoped to the newest exchange. a8s-browser copies the file into its
-own artifacts; this driver copies it again into the turn's own directory before
-attaching it. A picture that comes back byte-identical to one already fetched is
-reported as a failure, because it means the selector no longer tells the images
-apart.
+own artifacts, whose path the next download may reuse, so this driver copies
+each image into the turn's own directory **before asking for the next one**, and
+checks that the copy has the bytes the download produced. A picture that comes
+back byte-identical to one already kept is reported as a failure, because it
+means the selector no longer tells the images apart.
 
 **The download needs a8s-browser 0.3.1.** The seat's Chrome is a real Chrome
 attached over CDP, and it saves a download into its own download folder unless

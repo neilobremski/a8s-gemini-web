@@ -27,7 +27,6 @@ Unverified and best effort: naming a conversation after its correspondent, and
 selecting a model. Both are non-fatal by design — a turn that cannot rename or
 cannot switch models still delivers its reply.
 """
-import hashlib
 import json
 import os
 import re
@@ -102,6 +101,17 @@ STOP_ROLES = ("textbox", "contentinfo", "form", "navigation", "banner")
 # ran without error and attached nothing: no chip, no filename, no progress.
 UPLOAD_MENU_SELECTOR = 'button[aria-label="Upload & tools"]'
 UPLOAD_MENU_ITEM = "Upload files"
+
+# What an uploaded file looks like in the composer, which is the `group` that
+# holds the prompt box. A document gets a chip with its name in it (see
+# `chip_label`). An image gets a thumbnail, `img "attachment"`, with no name
+# anywhere (observed 2026-09-24). The conversation above the composer carries
+# images too, so chips are only ever counted inside the composer.
+IMAGE_CHIP_NAME = "attachment"
+IMAGE_UPLOAD_TYPES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+# Types that may be shown either way. Nobody has watched one land, so either
+# chip counts, as long as the total rises by one for each of them.
+EITHER_CHIP_TYPES = (".svg", ".heic", ".heif", ".avif", ".bmp", ".tif", ".tiff", ".ico")
 
 # The composer's own send control, and the only positive readiness evidence this
 # driver has. It does not exist while the prompt box is empty, and a snapshot
@@ -497,8 +507,12 @@ def _newest_turn(snapshot):
     start = _last_model_turn(lines)
     if start < 0:
         return []
+    # The composer is never part of a turn: an image put in for the next message
+    # is a thumbnail there, not a picture Gemini drew.
+    span = _composer_span(lines)
+    stop = span[0] if span and span[0] > start else len(lines)
     turn = []
-    for line in lines[start + 1:]:
+    for line in lines[start + 1:stop]:
         role, name, _ = node(line)
         if turn_heading(role, name) or role in STOP_ROLES:
             break
@@ -966,57 +980,30 @@ def await_reply(browser, sent, baseline="", baseline_counts=None, now=None, slee
         sleep(POLL_SECONDS)
 
 
-def download_images(browser, count):
-    """Fetch each generated image in the newest turn through a8s-browser's `download`.
+def download_image(browser, index, count):
+    """Fetch image `index` of `count` in the newest turn through a8s-browser's `download`.
 
-    Returns `(paths, failures)`: the files a8s-browser saved, in image order, and
-    one sentence per image that did not come back. A failure is named rather
-    than dropped, because an answer that silently arrives without the picture it
-    was asked for reads as Gemini's failure rather than this seat's.
-
-    The paths are a8s-browser's own artifacts. The caller copies them somewhere
-    it owns before handing them on.
+    Returns `(path, failure)`: the file a8s-browser saved, or "" and one
+    sentence saying why not. The path is a8s-browser's own artifact and may be
+    reused by the next download, so the caller copies it before asking for
+    another.
     """
-    paths = []
-    failures = []
-    digests = {}
-    for index in range(1, count + 1):
-        selector = image_download_selector(index)
-        script = f"download {shlex.quote(selector)} {DOWNLOAD_WAIT_SECONDS}"
-        which = f"image {index} of {count}"
-        try:
-            transcript = browser.run(script)
-        except BrowserError as exc:
-            failures.append(f"{which} could not be downloaded: {exc}")
-            continue
-        if not transcript.ok:
-            failures.append(f"{which} could not be downloaded: {transcript.error}")
-            continue
-        path = _first_output(transcript, "download").strip()
-        if not path or not os.path.isfile(path):
-            failures.append(
-                f"{which} could not be downloaded: a8s-browser named {path or 'no file'}, "
-                "which is not there"
-            )
-            continue
-        digest = _digest(path)
-        if digest in digests:
-            # The selector reached an image already fetched, which means it no
-            # longer tells this turn's images apart. Sending the same picture
-            # twice would hide that the other one is missing.
-            failures.append(
-                f"{which} could not be downloaded: the page handed back image "
-                f"{digests[digest]} again, so this seat cannot reach the others"
-            )
-            continue
-        digests[digest] = index
-        paths.append(path)
-    return paths, failures
-
-
-def _digest(path):
-    with open(path, "rb") as handle:
-        return hashlib.sha256(handle.read()).hexdigest()
+    selector = image_download_selector(index)
+    script = f"download {shlex.quote(selector)} {DOWNLOAD_WAIT_SECONDS}"
+    which = f"image {index} of {count}"
+    try:
+        transcript = browser.run(script)
+    except BrowserError as exc:
+        return "", f"{which} could not be downloaded: {exc}"
+    if not transcript.ok:
+        return "", f"{which} could not be downloaded: {transcript.error}"
+    path = _first_output(transcript, "download").strip()
+    if not path or not os.path.isfile(path):
+        return "", (
+            f"{which} could not be downloaded: a8s-browser named {path or 'no file'}, "
+            "which is not there"
+        )
+    return path, ""
 
 
 SUBMIT_STEP = "press Enter"
@@ -1082,15 +1069,104 @@ def chip_label(name):
     return stem
 
 
-def _name_counts(snapshot, names):
-    """How many times each file's chip label appears in the page, as a tuple.
+def _prompt_box_index(lines):
+    """The line of the prompt box, preferring a textbox that says what it is for."""
+    fallback = -1
+    for index, line in enumerate(lines):
+        role, name, _ = node(line)
+        if role != "textbox":
+            continue
+        if any(hint in name.lower() for hint in PROMPT_HINTS):
+            return index
+        if fallback < 0:
+            fallback = index
+    return fallback
 
-    A count rather than a presence test, because the conversation above the
-    composer is part of the same snapshot: a correspondent who sent `report.pdf`
-    an hour ago leaves that name on the page forever, and "is it there?" answers
-    yes before the new upload has started.
+
+def _composer_span(lines):
+    """`(start, end)` of the composer — the `group` that holds the prompt box —
+    with `start` the group's own line, or None when there is no such group."""
+    box = _prompt_box_index(lines)
+    if box < 0:
+        return None
+    depth = _indent(lines[box])
+    start = -1
+    for index in range(box - 1, -1, -1):
+        indent = _indent(lines[index])
+        if indent >= depth:
+            continue
+        depth = indent
+        if node(lines[index])[0] == "group":
+            start = index
+            break
+    if start < 0:
+        return None
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > depth):
+        end += 1
+    return start, end
+
+
+def _composer(lines):
+    """The composer's lines, or None.
+
+    None is "no composer found", and it is an answer of its own: nothing inside
+    it can be counted, so no upload can be confirmed from it.
     """
-    return tuple((snapshot or "").count(chip_label(name)) for name in names)
+    span = _composer_span(lines)
+    if span is None:
+        return None
+    return lines[span[0] + 1:span[1]]
+
+
+def chips(snapshot, names):
+    """What the composer shows for these files, or None when there is no composer.
+
+    Returns `(labels, images)`: how many times each file's `chip_label` appears
+    in the composer, as a tuple, and how many image thumbnails it holds. Counts
+    rather than presence, and read against a baseline taken before the upload,
+    so text already in the composer never confirms anything.
+    """
+    composer = _composer((snapshot or "").splitlines())
+    if composer is None:
+        return None
+    text = "\n".join(composer)
+    labels = tuple(text.count(chip_label(name)) for name in names)
+    images = 0
+    for line in composer:
+        role, name, _ = node(line)
+        if role == "img" and name == IMAGE_CHIP_NAME:
+            images += 1
+    return labels, images
+
+
+def _chip_kind(name):
+    ext = os.path.splitext(name)[1].lower()
+    if ext in IMAGE_UPLOAD_TYPES:
+        return "image"
+    if ext in EITHER_CHIP_TYPES:
+        return "either"
+    return "named"
+
+
+def uploads_shown(before, after, names):
+    """Whether the composer shows every file of this upload.
+
+    A named chip must appear once more for each document. Image thumbnails must
+    rise by the number of images. A type that could be shown either way may be
+    either, but the total still has to rise by one for each of those files, so
+    one chip is never taken as proof of two uploads.
+    """
+    (was_labels, was_images), (labels, images) = before, after
+    rise = [now - was for now, was in zip(labels, was_labels, strict=True)]
+    kinds = [_chip_kind(name) for name in names]
+    if any(up < 1 for up, kind in zip(rise, kinds, strict=True) if kind == "named"):
+        return False
+    spare = images - was_images - kinds.count("image")
+    if spare < 0:
+        return False
+    either = [up for up, kind in zip(rise, kinds, strict=True) if kind == "either"]
+    return spare + sum(1 for up in either if up > 0) >= len(either)
 
 
 def upload_script(path):
@@ -1164,7 +1240,7 @@ def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
     before = _snapshot_of(_run(browser, "snap", "reading the composer"), browser)
     if consent_pending(before):
         raise _consent_error(browser, names)
-    baseline = _name_counts(before, names)
+    baseline = chips(before, names)
 
     for path in paths:
         _upload_one(browser, path, names)
@@ -1175,9 +1251,11 @@ def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
         snapshot = _snapshot_of(_run(browser, "snap", "reading the composer"), browser)
         if consent_pending(snapshot):
             raise _consent_error(browser, names)
-        counts = _name_counts(snapshot, names)
-        ready = send_ready(snapshot)
-        if ready and all(count > was for count, was in zip(counts, baseline, strict=True)):
+        shown = chips(snapshot, names)
+        # No composer, before or now, is no evidence: the same answer as a
+        # missing send control, and never ready.
+        ready = send_ready(snapshot) if shown is not None and baseline is not None else None
+        if ready and uploads_shown(baseline, shown, names):
             return names
         if now() >= deadline:
             break
@@ -1186,9 +1264,10 @@ def attach(browser, paths, wait=UPLOAD_WAIT_SECONDS, now=None, sleep=None):
     if ready is None:
         raise GeminiError(
             f"this seat cannot tell whether {', '.join(names)} finished uploading, so "
-            f"your message was not sent. Gemini's composer has no {SEND_BUTTON_NAME!r} "
-            "control in the page any more, and that control is what this driver reads "
-            "to know an upload is done. The page has changed shape — see "
+            f"your message was not sent. Gemini's composer — the group holding the "
+            f"prompt box, with its file chips and its {SEND_BUTTON_NAME!r} control — "
+            "is not in the page the way this driver reads it to know an upload is "
+            "done. The page has changed shape — see "
             "docs/gemini-ui.md, which names the row to fix."
         )
     raise GeminiError(

@@ -224,22 +224,27 @@ class FakeGeminiSeat:
             )
             lines.append('  - button "Agree (Closes dialog box and gives disclaimer)" [ref=e5]')
         pending = False
+        # The composer: the group holding the prompt box, its chips and its send
+        # control, in the shape the live page has (2026-09-24).
+        composer = []
         for name in self.attached:
-            # The live chip (2026-09-24): the extension in capitals, then the
-            # name without it. The full filename is not in it.
             ext = os.path.splitext(name)[1]
-            stem = gemini.chip_label(name)
-            lines += [
-                "  - generic [ref=e6] [cursor=pointer]:",
-                f"    - generic [ref=e6a]: {ext.lstrip('.').upper()}",
-                f"    - generic [ref=e6b]: {stem}",
+            if ext.lower() in gemini.IMAGE_UPLOAD_TYPES:
+                # An image is a thumbnail with no name anywhere.
+                composer.append(f'      - img "{gemini.IMAGE_CHIP_NAME}" [ref=e6]')
+                continue
+            # A document: the extension in capitals, then the name without it.
+            composer += [
+                "      - generic [ref=e6] [cursor=pointer]:",
+                f"        - generic [ref=e6a]: {ext.lstrip('.').upper()}",
+                f"        - generic [ref=e6b]: {gemini.chip_label(name)}",
             ]
         if self.attached and self.upload_pending_polls > 0:
             # The chip is there and the upload is not done. Deliberately static:
             # two identical snapshots must not read as a finished upload.
             self.upload_pending_polls -= 1
             pending = True
-            lines.append('  - progressbar "Uploading" [ref=e7]')
+            composer.append('      - progressbar "Uploading" [ref=e7]')
         for index, (role, text) in enumerate(self.history):
             ref = f"e{10 + index * 4}"
             last = index == len(self.history) - 1
@@ -264,12 +269,13 @@ class FakeGeminiSeat:
                     f'  - button "{label}" [ref={ref}{n}]'
                     for n, label in enumerate(gemini.COMPLETION_BUTTONS)
                 ]
-        lines.append(f'  - textbox "{self.label}" [ref=e90]')
+        composer.append(f'      - textbox "{self.label}" [ref=e90]')
         if self.draft and self.send_button:
             # The live control only exists once the prompt box has text, and a
             # snapshot marks a disabled node with a trailing `[disabled]`.
             flag = " [disabled]" if pending else ""
-            lines.append(f'  - button "{gemini.SEND_BUTTON_NAME}" [ref=e91]{flag}')
+            composer.append(f'      - button "{gemini.SEND_BUTTON_NAME}" [ref=e91]{flag}')
+        lines += ["  - group [ref=e88]:", "    - generic [ref=e89]:", *composer]
         lines.append("  - paragraph: Gemini is AI and can make mistakes.")
         return "\n".join(lines) + "\n"
 

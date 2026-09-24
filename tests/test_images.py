@@ -10,6 +10,7 @@ from test_gemini import transcript
 from test_handler import answer
 
 import gemini
+import handler
 
 PROMPT = "Create an image of a tile map with a few biomes"
 
@@ -287,10 +288,15 @@ class TestTheReply:
     def test_two_images_are_two_files_even_when_named_alike(
         self, tmp_path, outbox, clock, state_home
     ):
-        seat = _image_seat(tmp_path, [("map.png", PNG), ("map.png", PNG + b"2")])
+        # The fake saves both downloads to one artifact path, as a browser that
+        # names artifacts by the second can. Each must be kept before the next.
+        first, second = PNG + b"FIRST", PNG + b"SECOND"
+        seat = _image_seat(tmp_path, [("map.png", first), ("map.png", second)])
         answer("gemini", "example-sender", PROMPT, outbox, seat)
         assert outbox.last == "Generated 2 images."
         assert outbox.last_names == ["map.png", "map-2.png"]
+        contents = [open(path, "rb").read() for path in outbox.last_files]
+        assert contents == [first, second]
         downloads = [s for s in seat.scripts if s.startswith("download ")]
         assert [":nth-child(1 of" in downloads[0], ":nth-child(2 of" in downloads[1]] == [
             True,
@@ -335,3 +341,38 @@ class TestTheReply:
         answer("gemini", "example-sender", "what is the status", outbox, seat)
         assert not any(script.startswith("download") for script in seat.scripts)
         assert outbox.last_files == []
+
+
+class TestStatusSurvivesTheCap:
+    """A long answer must not push the seat's own delivery notes out of the body."""
+
+    def test_a_failed_image_is_named_beside_a_full_length_answer(
+        self, tmp_path, outbox, clock, state_home
+    ):
+        answer_text = "x" * handler.MAX_BODY
+        seat = _image_seat(tmp_path, [("lost.png", PNG)], reply=answer_text)
+        seat.download_fails = {1}
+        assert answer("gemini", "example-sender", PROMPT, outbox, seat) == 0
+        assert len(outbox.last) <= handler.MAX_BODY
+        assert "image 1 of 1 could not be downloaded" in outbox.last
+        # The whole answer still travels, as the reply file.
+        assert outbox.last_names == [handler.LONG_REPLY_NAME]
+        with open(outbox.last_files[0]) as handle:
+            assert handle.read().strip() == answer_text
+
+    def test_an_answer_that_fits_alone_but_not_with_its_notes_goes_as_a_file(
+        self, tmp_path, outbox, clock, state_home
+    ):
+        answer_text = "y" * (handler.MAX_BODY - 20)
+        seat = _image_seat(tmp_path, [("one.png", PNG), ("two.png", PNG + b"2")],
+                           reply=answer_text)
+        seat.download_fails = {2}
+        answer("gemini", "example-sender", PROMPT, outbox, seat)
+        assert "image 2 of 2 could not be downloaded" in outbox.last
+        assert outbox.last_names == [handler.LONG_REPLY_NAME, "one.png"]
+
+    def test_compose_shortens_the_reply_never_the_notes(self):
+        body = handler._compose("z" * 5000, ["the note that must survive"])
+        assert len(body) <= handler.MAX_BODY
+        assert body.endswith("--\nthe note that must survive")
+        assert handler.CUT_MARK in body
