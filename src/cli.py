@@ -31,9 +31,11 @@ def _node_options(parser):
     )
 
 
-def _print_reply(recipient, body):
+def _print_reply(recipient, body, files=()):
     print(f"--- reply to {recipient} ---")
     print(body)
+    for path in files or ():
+        print(f"--- attached: {path}")
 
 
 def _sessions(seat):

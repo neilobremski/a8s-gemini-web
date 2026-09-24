@@ -37,6 +37,11 @@ below, and put whatever it says now into the constant beside it.
 | `MODEL_BUTTON_SELECTORS` | CSS for that switcher, `button[aria-label^="Open mode picker"]` first | derived from the observed name, **click untested** |
 | `RATE_LIMIT_PHRASES` | Gemini's own quota refusal, matched near the front of a short reply | reading, **untested** |
 | `TROUBLE_PHRASES` | `couldn't generate`, `something went wrong` | b3t |
+| `COMPOSER_SELECTOR` | `div.ql-editor[contenteditable="true"]` — the prompt box as an *element*, for `drop`. `div[contenteditable="true"]` alone matches two nodes (Quill keeps a hidden `.ql-clipboard`) and Playwright refuses an ambiguous target | observed 2026-09-23 |
+| `CONSENT_HEADING` | `Creating content from images and files` — the dialog Gemini raises the first time a profile attaches anything, with `Cancel` and `Agree`. Until a person presses Agree, no file lands | observed 2026-09-23 |
+| — (uploading) | `drop <COMPOSER_SELECTOR> <abs path> ...`, before the submitting keystroke | observed 2026-09-23 |
+| `SEND_BUTTON_NAME` | `Send message` — a button in the composer, with an `img: arrow_upward`. **It does not exist while the prompt box is empty**, and appears once there is text. A snapshot marks a disabled node with a trailing `[disabled]`, so this is the page's own answer to "will you send this now" | observed 2026-09-23 |
+| — (the upload menu) | `button "Upload & tools"`, with an `img: plus` inside it. **Not used.** It opens a menu, and this driver does not open menus | observed 2026-09-23 |
 
 The date is when someone looked. The interface changes without notice, so
 treat every row as a reading rather than a constant.
@@ -103,9 +108,73 @@ a long answer that explains rate limiting is an answer and withholding it would
 be the worse mistake. If a refusal gets relayed as an answer, add its wording
 to `RATE_LIMIT_PHRASES`.
 
-**Out of scope for v1.** Images, file uploads and anything behind the
-`Upload & tools` menu. b3t drives that menu through Playwright locators in
-`run-code`, which is a different mechanism from the one this driver uses.
+## Files
+
+**A drop reaches the composer.** `drop div.ql-editor[contenteditable="true"]
+--path <abs>` was run against the live page and the page reacted to it. This is
+the inbound path, and it is preferred over `Upload & tools` because that control
+opens a menu — and an open menu is how this driver loses a turn.
+
+**There is no `input[type=file]` on the page at rest.** A DOM query for one
+returns zero, so `setInputFiles` against a selector is not available; Gemini
+creates the input when its own upload flow runs. That is why the drop, rather
+than a hidden input, is the mechanism.
+
+**The first upload on a profile needs a person.** The drop raised a modal —
+heading `Creating content from images and files`, buttons `Cancel` and `Agree` —
+and the file did not attach. It is a disclaimer about rights in uploaded content.
+This driver detects it and says so; it does not press Agree. Accepting terms on
+an account is the same kind of one-time, by-hand step as signing the profile in,
+and it belongs to whoever owns the account.
+
+**The upload confirmation asks the composer, it does not read the chip.** The
+snapshot is the whole page, so three readings are wrong and one is right.
+
+*Wrong:* "is the filename there?" — answered yes by a conversation that mentioned
+the file an hour ago, before this upload started.
+
+*Wrong:* "has the filename just appeared?" — a chip renders while the upload is
+still running.
+
+*Wrong:* "has the page stopped changing?" — a pending upload is **static**. A
+paused progress bar and a disabled button read identically from one poll to the
+next, so a settle proves only that nothing moved.
+
+*Right:* ask the control whose whole job is to answer it. `Send message` is
+disabled while the upload runs and enabled when it is done. That is positive
+evidence about the current composer rather than the absence of a marker nobody
+has shown this driver.
+
+So `attach` requires **one more occurrence of each name than a baseline taken
+before the drop** — which stops history confirming anything, while still letting
+the same filename be sent twice — **and** `send_ready(snapshot) is True`.
+
+`send_ready` has three answers, and the third is the point. `True` ready, `False`
+not yet, and **`None` for no evidence either way**, which is never treated as
+ready. If the control is gone from the page, this driver can no longer tell a
+finished upload from a running one, so the message is kept and the reply names
+the prerequisite instead of guessing.
+
+**This is why the text is typed before the files go in.** The send control does
+not render on an empty composer, so a drop that happened first would leave
+nothing to read.
+
+The attachment chip's own role and name are still unobserved — the consent
+dialog blocks reaching them and accepting it is not this driver's to do. Nothing
+above depends on them.
+
+**Outbound artifacts are not implemented.** `img` is in neither `TEXT_ROLES` nor
+the roles reply extraction collects, so a generated image is invisible to
+`await_reply` today. Two things are unknown and both need a turn that generates
+one: the role and accessible name of the image node, and whether the
+`COMPLETION_BUTTONS` cluster appears *before* the image finishes rendering — if
+it does, the turn ends before the artifact exists and completion detection needs
+to change. a8s-browser's `download <target>` verb exists for this; nothing here
+calls it yet.
+
+Do not port b3t's download recipe as written. Its `mousewheel 2000 0` scrolls
+**horizontally**, because the signature is `mousewheel <dx> <dy>` — that step has
+never scrolled a page down. a8s-browser's own `scroll <dy>` is correct.
 
 ## When a turn goes wrong
 

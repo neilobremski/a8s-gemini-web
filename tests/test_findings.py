@@ -191,7 +191,7 @@ class Refuses:
         self.failures = failures
         self.sent = []
 
-    def __call__(self, recipient, body):
+    def __call__(self, recipient, body, files=()):
         if self.failures > 0:
             self.failures -= 1
             return 1
@@ -564,10 +564,10 @@ def test_a_hand_run_ask_never_delivers_a_held_reply_to_the_terminal(
     printed = []
     network = []
 
-    def display(recipient, body):
+    def display(recipient, body, files=()):
         printed.append((recipient, body))
 
-    def tell(recipient, body):
+    def tell(recipient, body, files=()):
         network.append((recipient, body))
         return 0
 
@@ -607,7 +607,7 @@ def test_two_flushers_cannot_send_the_same_held_reply_twice(state_home):
     sent = []
     guard = threading.Lock()
 
-    def send(recipient, body):
+    def send(recipient, body, files=()):
         at_the_gate.wait(timeout=5)
         with guard:
             sent.append((recipient, body))
@@ -628,7 +628,7 @@ def test_a_failed_send_puts_the_held_reply_back(state_home):
     root = os.path.join(str(state_home), "a8s-gemini-web")
     held = outbox_module.Outbox("gemini", root)
     held.keep("someone", "still waiting")
-    delivered, waiting = held.flush(lambda to, body: 1)
+    delivered, waiting = held.flush(lambda to, body, files: 1)
     assert (delivered, waiting) == (0, 1)
     assert held.waiting()[0][2] == "still waiting"
 
@@ -642,10 +642,10 @@ def test_a_claim_left_by_a_dead_run_comes_back(state_home, monkeypatch):
     # flush recovers it — listing the queue has no side effects.
     assert held.waiting() == []
     sent = []
-    assert held.flush(lambda to, body: sent.append((to, body)) or 0) == (0, 0)
+    assert held.flush(lambda to, body, files: sent.append((to, body)) or 0) == (0, 0)
 
     monkeypatch.setattr(outbox_module, "RECLAIM_SECONDS", -1.0)
-    delivered, remaining = held.flush(lambda to, body: sent.append((to, body)) or 0)
+    delivered, remaining = held.flush(lambda to, body, files: sent.append((to, body)) or 0)
     assert (delivered, remaining) == (1, 0)
     assert sent == [("someone", "abandoned")]
     assert not os.path.exists(stranded)
@@ -663,7 +663,7 @@ def test_a_tell_that_cannot_be_launched_is_a_failed_delivery(monkeypatch, capsys
 
 
 def test_a_sender_that_cannot_start_still_holds_the_reply(tmp_path, clock, state_home):
-    def cannot_start(recipient, body):
+    def cannot_start(recipient, body, files=()):
         raise FileNotFoundError(2, "No such file or directory", "tell")
 
     code = handler.handle(
@@ -715,14 +715,14 @@ def test_an_aged_reply_is_not_delivered_twice_by_a_second_flusher(state_home):
     sent = []
     guard = threading.Lock()
 
-    def slow(recipient, body):
+    def slow(recipient, body, files=()):
         with guard:
             sent.append((recipient, body))
         inside.set()
         release.wait(timeout=5)
         return 0
 
-    def quick(recipient, body):
+    def quick(recipient, body, files=()):
         with guard:
             sent.append((recipient, body))
         return 0
@@ -744,7 +744,7 @@ def test_a_second_flusher_leaves_the_queue_to_the_first(state_home):
     held = outbox_module.Outbox("gemini", root)
     held.keep("someone", "only copy")
     with FileLock(held.lock_path):
-        assert held.flush(lambda to, body: 0) == (0, 1)
+        assert held.flush(lambda to, body, files: 0) == (0, 1)
     assert held.waiting()[0][2] == "only copy"
 
 
@@ -754,12 +754,12 @@ def test_a_claim_with_no_readable_stamp_is_recovered(state_home):
     path = held.keep("someone", "hand-edited claim")
     os.rename(path, f"{path}{outbox_module.CLAIM}not-a-time")
     sent = []
-    assert held.flush(lambda to, body: sent.append((to, body)) or 0) == (1, 0)
+    assert held.flush(lambda to, body, files: sent.append((to, body)) or 0) == (1, 0)
     assert sent == [("someone", "hand-edited claim")]
 
 
 def test_flushing_an_empty_queue_takes_no_lock(state_home):
     root = os.path.join(str(state_home), "a8s-gemini-web")
     held = outbox_module.Outbox("gemini", root)
-    assert held.flush(lambda to, body: 0) == (0, 0)
+    assert held.flush(lambda to, body, files: 0) == (0, 0)
     assert not os.path.exists(held.lock_path)

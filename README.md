@@ -22,7 +22,23 @@ a8s-browser -s gemini-profile snap      # should show the Gemini page, not a sig
 
 That seat name is this driver's `A8S_GEMINI_BROWSER_SEAT`. It also needs
 [ar3](https://github.com/witw-llc/ar3) — `a8s` and `tell` — running on the same
-machine, which is what carries the messages.
+machine, which is what carries the messages. The same machine is the whole story
+for files, too: a path this driver hands the browser is a local path, so the two
+are never on different hosts.
+
+**One more by-hand step, if you want to send files.** The first time a profile
+attaches anything, Gemini raises a disclaimer about rights in uploaded content,
+and nothing attaches until somebody presses `Agree`. Do it once, in the same
+window you signed in with:
+
+```bash
+a8s-browser -s gemini-profile open      # drag any file into the prompt box
+# press Agree in the dialog that appears
+```
+
+Until that is done, a tell carrying a file comes back saying so and the message
+stays queued — this driver does not accept terms on an account it drives, for
+the same reason it never signs in.
 
 Linux (or WSL). Python standard library only; nothing to build, nothing to pip
 install.
@@ -51,7 +67,7 @@ Per-node vars, all set the same way (`a8s vars gemini set <KEY> <value>`):
 |---|---|
 | `A8S_GEMINI_WEB` | path to this repo's launcher |
 | `A8S_GEMINI_BROWSER_SEAT` | the a8s-browser seat holding the signed-in profile |
-| `A8S_GEMINI_ALLOW` | comma-separated senders this seat answers. **Unset means nobody** — the seat drives a signed-in account, so nobody is allowed by default |
+| `A8S_GEMINI_ALLOW` | comma-separated senders this seat answers. **Unset means nobody** — the seat drives a signed-in account, so nobody is allowed by default. An allowed sender can type into that account *and upload files into it*, so the list is the whole trust boundary |
 | `A8S_GEMINI_MODEL` | optional; a model as Gemini's own menu labels it (`Pro`, `Flash`). Unset takes whatever Gemini defaults to, which is the point — the product needs no configuration |
 | `A8S_GEMINI_BROWSER_CMD` | optional; the a8s-browser launcher's path, for when a wake's `PATH` does not carry it |
 
@@ -92,10 +108,32 @@ Conversations are remembered in `$XDG_STATE_HOME/a8s-gemini-web` (or
 
 ## What v1 does
 
-Text in, text out. No images, no file uploads, and nothing behind Gemini's
-`Upload & tools` menu. Selecting a model is best effort — it is one of Gemini's
-Angular menus, and a seat that cannot switch keeps the turn and runs on the
-default.
+Text in, text out, and files in.
+
+```bash
+tell gemini --attach report.pdf "what does this say about margins?"
+```
+
+a8s delivers the file to this machine and names it in the message; the driver
+takes the path back out of the prose, drops the file into the composer, waits
+for Gemini to show it, and only then sends. Nothing is submitted until the file
+is in the page, because a question about a document Gemini never received reads
+as a model failure and costs a turn to discover. A file over `tell`'s size cap
+arrives as `--split` parts and is joined back together here; a set with a part
+missing is refused and named rather than joined short.
+
+A reply too long for the message cap comes back as `gemini-reply.md` attached,
+instead of being cut.
+
+**Files out are not done.** A generated image or a downloadable artifact does not
+come back yet: `img` is not one of the roles reply extraction reads, so the image
+is invisible to the driver. The machinery is in place — a8s-browser has a
+`download` verb and held replies carry attachments — and
+[`docs/gemini-ui.md`](docs/gemini-ui.md) lists exactly what has to be observed on
+a live page to finish it.
+
+Selecting a model is best effort — it is one of Gemini's Angular menus, and a
+seat that cannot switch keeps the turn and runs on the default.
 
 Every selector and label this driver relies on is in `src/gemini.py`, listed
 with its source in [`docs/gemini-ui.md`](docs/gemini-ui.md). Google changes the
